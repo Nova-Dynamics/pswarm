@@ -79,8 +79,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="ParticleSlam.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ParticleSlam.h" />
     <ClInclude Include="rt_jr.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

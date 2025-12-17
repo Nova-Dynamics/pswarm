@@ -1,1 +1,116 @@
 #pragma once
+
+#include "rt_jr.hpp"
+#include <cuda_runtime.h>
+#include <cstdint>
+
+using namespace rt_jr;
+
+struct Particle {
+    Vec3 state;
+    double timestamp;
+};
+
+struct ChunkCell {
+    int16_t num_pos;
+    int16_t num_neg;
+};
+
+struct Chunk {
+    // 60x60 cells for 6m x 6m area with 0.1m cell size
+    ChunkCell cells[60][60];
+    double timestamp;
+};
+
+struct Map {
+    ChunkCell* cells;  // Dynamically allocated array
+    int width;         // Number of cells in x direction
+    int height;        // Number of cells in y direction
+    float min_x;       // Minimum x coordinate in meters
+    float min_y;       // Minimum y coordinate in meters
+    float max_x;       // Maximum x coordinate in meters
+    float max_y;       // Maximum y coordinate in meters
+    float cell_size;   // Size of each cell in meters
+    
+    Map() : cells(nullptr), width(0), height(0), 
+            min_x(0), min_y(0), max_x(0), max_y(0), cell_size(0.1f) {}
+    
+    ~Map() {
+        if (cells) delete[] cells;
+    }
+};
+
+struct KernelParams {
+    int num_particles;
+    int max_trajectory_length;
+    float cell_size_m;
+    float pos_weight;
+    float neg_weight;
+    float alpha_prior;
+    float beta_prior;
+};
+
+class ParticleSlam {
+public:
+    ParticleSlam(int num_particles, 
+                 int max_trajectory_length, 
+                 int max_chunk_length,
+                 float cell_size_m = 0.1f,
+                 float pos_weight = 0.7f,
+                 float neg_weight = 0.4f,
+                 float alpha_prior = 1.0f,
+                 float beta_prior = 1.5f);
+    
+    ~ParticleSlam();
+    
+    // Initialize and allocate memory
+    void init(unsigned long long random_seed = 1234ULL);
+    
+    // Apply a dead reckoning step
+    void apply_step(Vec3 dx_step, double timestamp);
+    
+    // Ingest a visual measurement chunk
+    void ingest_visual_measurement(const Chunk& chunk, double timestamp, bool resample = true);
+    
+    // Download functions for visualization
+    void download_chunk_states(Vec3* h_chunk_states, int max_chunks) const;
+    void download_chunk_states_for_particle(Vec3* h_chunk_states, int particle_idx, int max_chunks) const;
+    void download_scores(float* h_scores) const;
+    
+    // Create accumulated map from best particle
+    Map* bake_map();
+    
+    // State accessors
+    int get_current_chunk_count() const { return current_chunk_index_; }
+    int get_current_timestep() const { return current_timestep_; }
+    int get_num_particles() const { return params_.num_particles; }
+    
+private:
+    // Parameters
+    KernelParams params_;
+    int max_chunk_length_;
+    
+    // Device pointers
+    Particle* d_particles_;
+    Particle* d_particles_swap_;
+    Vec3* d_chunk_states_;
+    Vec3* d_chunk_states_swap_;
+    Chunk* d_chunks_;
+    struct curandStateXORWOW* d_randStates_;
+    float* d_log_likelihoods_;
+    float* d_scores_raw_;
+    float* d_scores_;
+    float* d_cumsum_;
+    ChunkCell* d_cur_maps_;
+    
+    // State tracking
+    int current_timestep_;
+    int current_chunk_index_;
+    double last_chunk_timestamp_;
+    bool first_step_;
+    bool initialized_;
+    
+    // Internal helpers
+    void evaluate_and_resample(int chunk_index);
+    void extract_chunk_states(int timestep, int chunk_index);
+};
