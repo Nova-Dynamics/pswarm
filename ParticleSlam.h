@@ -66,24 +66,40 @@ public:
     // Initialize and allocate memory
     void init(unsigned long long random_seed = 1234ULL);
     
-    // Apply a dead reckoning step
-    void apply_step(Vec3 dx_step, double timestamp);
+    // Apply a dead reckoning step with configurable process noise
+    // pos_std: standard deviation for position noise (multiplicative)
+    // yaw_std: standard deviation for yaw noise (additive)
+    void apply_step(Vec3 dx_step, double timestamp, float pos_std = 1.6e-3f, float yaw_std = 1e-3f);
     
     // Ingest a visual measurement chunk
-    void ingest_visual_measurement(const Chunk& chunk, double timestamp, bool resample = true);
+    int ingest_visual_measurement(const Chunk& chunk);
     
+    void evaluate_and_resample(int chunk_index);
+
+
     // Download functions for visualization
     void download_chunk_states(Vec3* h_chunk_states, int max_chunks) const;
     void download_chunk_states_for_particle(Vec3* h_chunk_states, int particle_idx, int max_chunks) const;
     void download_scores(float* h_scores) const;
     
-    // Create accumulated map from best particle
-    Map* bake_map();
-    
     // State accessors
     int get_current_chunk_count() const { return current_chunk_index_; }
     int get_current_timestep() const { return current_timestep_; }
     int get_num_particles() const { return params_.num_particles; }
+    Particle* get_d_particles() const { return d_particles_; }
+
+    // Create accumulated map from best particle
+    Map* bake_best_particle_map();
+
+    // Mapping specific functions ==========================
+    void accumulate_map_from_trajectories(int chunk_index);
+
+
+    // Localization specific functions ======================
+    void accumulate_map_from_map(int chunk_index);
+    void set_global_map(const Map& map);
+    void uniform_initialize_particles();
+    void prune_particles_outside_map();
     
 private:
     // Parameters
@@ -101,16 +117,20 @@ private:
     float* d_scores_raw_;
     float* d_scores_;
     float* d_cumsum_;
-    ChunkCell* d_cur_maps_;
-    
+    ChunkCell* d_accumulated_maps;
+    Map* d_global_map_;
+    ChunkCell* d_global_map_cells_;
+    Map* h_global_map_;
+
     // State tracking
     int current_timestep_;
     int current_chunk_index_;
     double last_chunk_timestamp_;
     bool first_step_;
     bool initialized_;
-    
-    // Internal helpers
-    void evaluate_and_resample(int chunk_index);
-    void extract_chunk_states(int timestep, int chunk_index);
+    bool has_global_map_;
+
 };
+
+Map* load_map_from_file(const char* filename);
+bool save_map_to_file(const Map& map, const char* filename);

@@ -141,10 +141,232 @@ cv::Scalar interpolate_hsl(cv::Scalar c1, cv::Scalar c2, float frac) {
     );
 }
 
-int main()
+int localize()
 {
+ // Load JSON data
+    std::cout << "Loading one_loop_munged.json..." << std::endl;
+    std::ifstream json_file("one_loop_munged.json");
+    if (!json_file.is_open()) {
+        fprintf(stderr, "Failed to open one_loop_munged.json!\n");
+        return 1;
+    }
+    
+    json data;
+    json_file >> data;
+    json_file.close();
+    
+    std::cout << "Loaded " << data.size() << " entries from JSON" << std::endl;
+
+    Map* map = load_map_from_file("big_boi.bin");
+    if (map == nullptr) {
+        std::cerr << "Failed to load map from big_boi.bin" << std::endl;
+        return 1;
+    }
+
     // Create ParticleSlam instance with parameters
-    const int NUM_PARTICLES = 10000;
+    const int NUM_PARTICLES = 1000;
+    const int MAX_TRAJECTORY_LENGTH = 300;  // 10 seconds at 30 Hz
+    const int MAX_CHUNK_LENGTH = 5;     // TODO: FIX WRAPAROUND
+    
+    ParticleSlam mcl_slam(NUM_PARTICLES, MAX_TRAJECTORY_LENGTH, MAX_CHUNK_LENGTH);
+    
+    std::cout << "Initializing MCL SLAM with " << NUM_PARTICLES << " particles." << std::endl;
+    // Initialize the particle filter
+    mcl_slam.init();
+
+    std::cout << "Setting global map for MCL SLAM." << std::endl;  
+    
+    mcl_slam.set_global_map(*map);
+    
+    std::cout << "Uniformly initializing particles." << std::endl;
+    mcl_slam.uniform_initialize_particles();
+
+    // Visualization setup
+    cv::namedWindow("MCL Localization", cv::WINDOW_AUTOSIZE);
+    const int img_size = 1000;
+    const float view_range = 30.0f; // meters
+    const float pixels_per_meter = img_size / view_range;
+    int center_x = img_size / 2;
+    int center_y = img_size / 2;
+    
+    // Pre-render the map background once for better performance
+    std::cout << "Pre-rendering map background..." << std::endl;
+    cv::Mat background(img_size, img_size, CV_8UC3, cv::Scalar(255, 255, 255));
+    
+    // Draw global map as background
+    for (int my = 0; my < map->height; my++) {
+        for (int mx = 0; mx < map->width; mx++) {
+            int idx = my * map->width + mx;
+            ChunkCell cell = map->cells[idx];
+            
+            int total_obs = cell.num_pos + cell.num_neg;
+            if (total_obs > 1) {
+                // Calculate occupancy probability
+                float alpha = 1.0f + 0.7f * cell.num_pos;
+                float beta = 1.5f + 0.4f * cell.num_neg;
+                float prob = alpha / (alpha + beta);
+                
+                // Color from white (unoccupied) to black (occupied)
+                int gray = (int)(255.0f * (1.0f - prob));
+                cv::Scalar color(gray, gray, gray);
+                
+                // Convert map coordinates to pixel coordinates
+                float cell_world_x = map->min_x + mx * map->cell_size;
+                float cell_world_y = map->min_y + my * map->cell_size;
+                
+                int px = center_x + (int)(cell_world_x * pixels_per_meter);
+                int py = center_y - (int)(cell_world_y * pixels_per_meter);
+                
+                int cell_pixels = std::max(1, (int)(map->cell_size * pixels_per_meter));
+                
+                if (px >= 0 && px < img_size && py >= 0 && py < img_size) {
+                    cv::rectangle(background, 
+                                cv::Point(px, py), 
+                                cv::Point(px + cell_pixels, py + cell_pixels),
+                                color, -1);
+                }
+            }
+        }
+    }
+    
+    // Draw coordinate axes on background
+    cv::line(background, cv::Point(center_x, 0), cv::Point(center_x, img_size), cv::Scalar(200, 200, 200), 1);
+    cv::line(background, cv::Point(0, center_y), cv::Point(img_size, center_y), cv::Scalar(200, 200, 200), 1);
+    
+    std::cout << "Map background ready. Starting visualization..." << std::endl;
+    
+    // Track state for dx_step calculation
+    Vec3 prev_state = {0.0f, 0.0f, 0.0f};
+    bool first_dr_step = true;
+    
+    // Allocate host memory for particle states
+    Particle* h_particles = new Particle[NUM_PARTICLES * MAX_TRAJECTORY_LENGTH];
+    
+    // Process all entries from JSON
+    for (const auto& entry : data) {
+        std::string type = entry["type"];
+        double ts = entry["ts"];
+
+        if (type == "dr_step") {
+            Vec3 cur_state;
+            cur_state.x = entry["value"]["x"][0];
+            cur_state.y = entry["value"]["x"][1];
+            cur_state.z = entry["value"]["x"][2];
+
+            if (!first_dr_step) {
+                float theta = -prev_state.z;
+                Mat2 R = get_R_from_theta(theta);
+                Vec2 state_delta = {cur_state.x - prev_state.x, cur_state.y - prev_state.y};
+                Vec2 mean_delta = R.transpose() * state_delta;
+                float theta_delta = cur_state.z - prev_state.z;
+
+                Vec3 dx_step = {mean_delta.x, mean_delta.y, theta_delta};
+                // MCL noise parameters: larger noise for localization uncertainty
+                mcl_slam.apply_step(dx_step, ts, 0.1f, 0.003f);
+
+                mcl_slam.prune_particles_outside_map();
+                
+                // Download current particle states
+                int current_timestep = mcl_slam.get_current_timestep();
+                cudaMemcpy(h_particles, mcl_slam.get_d_particles(), 
+                          NUM_PARTICLES * MAX_TRAJECTORY_LENGTH * sizeof(Particle), 
+                          cudaMemcpyDeviceToHost);
+                
+                // Copy background instead of recreating it
+                cv::Mat img = background.clone();
+                
+                // Draw particles as arrows
+                for (int p = 0; p < NUM_PARTICLES; p++) {
+                    int particle_pos = p * MAX_TRAJECTORY_LENGTH + (current_timestep % MAX_TRAJECTORY_LENGTH);
+                    Particle particle = h_particles[particle_pos];
+                    
+                    float x = particle.state.x;
+                    float y = particle.state.y;
+                    float theta = particle.state.z;
+                    
+                    int px = center_x + (int)(x * pixels_per_meter);
+                    int py = center_y - (int)(y * pixels_per_meter);
+                    
+                    // Arrow length
+                    float arrow_length = 0.3f; // 30cm arrow
+                    int arrow_px = (int)(arrow_length * -sinf(-theta) * pixels_per_meter);
+                    int arrow_py = -(int)(arrow_length * cosf(-theta) * pixels_per_meter);
+                    
+                    // Draw arrow (blue for particles)
+                    cv::arrowedLine(img, cv::Point(px, py), cv::Point(px + arrow_px, py + arrow_py),
+                                  cv::Scalar(255, 0, 0), 1, cv::LINE_AA, 0, 0.3);
+                    
+                    // Draw small circle at particle position
+                    cv::circle(img, cv::Point(px, py), 2, cv::Scalar(0, 0, 255), -1);
+                }
+                
+                // Draw info
+                cv::rectangle(img, cv::Point(5, 5), cv::Point(280, 90), cv::Scalar(255, 255, 255), -1);
+                cv::putText(img, "Timestep: " + std::to_string(current_timestep), cv::Point(10, 30), 
+                          cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+                cv::putText(img, "Particles: " + std::to_string(NUM_PARTICLES), cv::Point(10, 60), 
+                          cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 2);
+                
+                cv::imshow("MCL Localization", img);
+                
+                if (cv::waitKey(1) == 27) {
+                    break;
+                }
+            } else {
+                first_dr_step = false;
+            }
+
+            prev_state = cur_state;
+        } else if (type == "map_measurement") {
+            // Package map measurement into chunk structure
+            Chunk h_chunk;
+            h_chunk.timestamp = ts;
+            
+            for (int i = 0; i < 60; i++) {
+                for (int j = 0; j < 60; j++) {
+                    h_chunk.cells[i][j].num_pos = 0;
+                    h_chunk.cells[i][j].num_neg = 0;
+                }
+            }
+
+            const auto& cells = entry["value"]["cells"];
+            for (int i = 0; i < 60; i++) {
+                for (int j = 0; j < 60; j++) {
+                    if (!cells[i][j].is_null()) {
+                        h_chunk.cells[i][j].num_pos = cells[i][j]["num_pos"];
+                        h_chunk.cells[i][j].num_neg = cells[i][j]["num_neg"];
+                    }
+                }
+            }
+
+            // Ingest the chunk
+            int c_idx = mcl_slam.ingest_visual_measurement(h_chunk);
+
+            if (c_idx == -1) {
+                std::cerr << "Failed to ingest chunk at timestamp " << ts << std::endl;
+                continue;
+            }
+
+            mcl_slam.accumulate_map_from_map(c_idx);
+
+            mcl_slam.evaluate_and_resample(c_idx);
+
+            // TODO: Prune particles that go off the map
+        }
+    }
+    
+    delete[] h_particles;
+    delete map;
+    
+    cv::destroyAllWindows();
+
+    return 0;
+}
+
+int map()
+{
+     // Create ParticleSlam instance with parameters
+    const int NUM_PARTICLES = 1000;
     const int MAX_TRAJECTORY_LENGTH = 300;  // 10 seconds at 30 Hz
     const int MAX_CHUNK_LENGTH = 3600;       // 1 hr at 1 Hz
     
@@ -212,6 +434,7 @@ int main()
                 float theta_delta = cur_state.z - prev_state.z;
 
                 Vec3 dx_step = {mean_delta.x, mean_delta.y, theta_delta};
+                // SLAM noise parameters: small noise for mapping (uses defaults)
                 slam.apply_step(dx_step, ts);
             } else {
                 first_dr_step = false;
@@ -242,9 +465,16 @@ int main()
             }
 
             // Ingest the chunk (with resampling)
-            slam.ingest_visual_measurement(h_chunk, ts, true);
+            int c_idx = slam.ingest_visual_measurement(h_chunk);
 
-            continue;
+            if (c_idx == -1) {
+                std::cerr << "Failed to ingest chunk at timestamp " << ts << std::endl;
+                continue;
+            }
+
+            slam.accumulate_map_from_trajectories(c_idx);
+
+            slam.evaluate_and_resample(c_idx);
             
             // Download data for visualization
             int num_chunks = slam.get_current_chunk_count();
@@ -293,7 +523,7 @@ int main()
     }
 
     // Bake final map from best particle
-    Map* final_map = slam.bake_map();
+    Map* final_map = slam.bake_best_particle_map();
     
     // Create image for map visualization
     int pixels_per_cell = 5;
@@ -388,4 +618,10 @@ int main()
     cv::destroyAllWindows();
 
     return 0;
+}
+
+int main()
+{
+   return localize();
+   //return map();
 }
