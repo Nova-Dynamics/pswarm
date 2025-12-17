@@ -12,7 +12,7 @@
 
 using json = nlohmann::json;
 
-#define NUM_PARTICLES 500
+#define NUM_PARTICLES 2000
 
 // 10 seconds at 30 Hz
 #define MAX_TRAJECTORY_LENGTH 300
@@ -75,15 +75,21 @@ __global__ void applyStep(Particle* particles, curandState* states, int num_part
     Vec2 mean_delta = { dx_step.x, dx_step.y };
     Vec2 particle_delta = P_R * mean_delta;
 
-    // Add gaussian noise to particle_delta
-    float noise_x = curand_normal(&states[idx]) * 1.6e-3f + 1.0f;  // mean=1.0, std=1.6e-3
-    float noise_y = curand_normal(&states[idx]) * 1.6e-3f + 1.0f;  // mean=1.0, std=1.6e-3
+    float theta_noise = 0;
     
-    particle_delta.x *= noise_x;
-    particle_delta.y *= noise_y;
+    // Add gaussian noise to particle_delta
+    if (particle_delta.length() > 1e-8f) {
+        float noise_x = curand_normal(&states[idx]) * 1.6e-3f + 1.0f;  // mean=1.0, std=1.6e-3
+        float noise_y = curand_normal(&states[idx]) * 1.6e-3f + 1.0f;  // mean=1.0, std=1.6e-3
+        
+        particle_delta.x *= noise_x;
+        particle_delta.y *= noise_y;
+        theta_noise = curand_normal(&states[idx]) * 1e-3f;  // mean=0, std=1e-3
+    }
+
 
     // Add gaussian noise to theta
-    float theta_noise = curand_normal(&states[idx]) * 1e-3f;  // mean=0, std=1e-3
+
 
     // Write new state to current timestep position
     particles[curr_pos].state.x = prev_particle.state.x + particle_delta.x;
@@ -105,97 +111,118 @@ __global__ void extractParticleStatesAtTimestep(Particle* particles, Vec3* chunk
     chunk_states[chunk_index * num_particles + idx] = state;
 }
 
-__global__ void evaluateParticles(Particle* particles, Chunk* chunks, Vec3* chunk_states, int num_particles, int last_chunk_index, float* log_likelihoods)
+
+__global__ void accumulateMapForParticles(Vec3* chunk_states, Chunk* chunks, ChunkCell* cur_maps, int num_particles, int last_chunk_index)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_particles) return;
-
-    // Get the particle state for this chunk
-    Vec3 state = chunk_states[last_chunk_index * num_particles + idx];
-
+    // Each block handles one particle, threads loop over cells
+    int particle_idx = blockIdx.x;
+    if (particle_idx >= num_particles) return;
+    
+    // Get the particle state for this chunk (shared across all threads in block)
+    Vec3 state = chunk_states[last_chunk_index * num_particles + particle_idx];
+    
     Pair<Mat2, Vec2> R_t = get_affine_tx_from_state(state);
     Mat2 R = R_t.first;
     Vec2 t = R_t.second;
-
-    // Access the chunk
-    Chunk prediction = chunks[last_chunk_index];
-    ChunkCell cur_map[60][60];
     
-    // Initialize cur_map to zero
-    for (int i = 0; i < 60; i++) {
-        for (int j = 0; j < 60; j++) {
-            cur_map[i][j].num_pos = 0;
-            cur_map[i][j].num_neg = 0;
+    // Access the prediction chunk
+    Chunk prediction = chunks[last_chunk_index];
+    
+    // Grid-stride loop over cells (each thread processes multiple cells)
+    for (int cell_idx = threadIdx.x; cell_idx < 3600; cell_idx += blockDim.x) {
+        int xi = cell_idx / 60;
+        int yi = cell_idx % 60;
+        ChunkCell pred_cell = prediction.cells[xi][yi];
+        
+        // Skip empty prediction cells
+        if (pred_cell.num_pos == 0 && pred_cell.num_neg == 0) {
+            int map_idx = particle_idx * 3600 + cell_idx;
+            cur_maps[map_idx].num_pos = 0;
+            cur_maps[map_idx].num_neg = 0;
+            continue;  // Skip to next cell, don't exit the entire thread!
         }
-    }
-
-    // Loop through chunk states and check if they are within 6m of the state
-    for (int i = 0; i < last_chunk_index; i++) {
-        Vec3 other_state = chunk_states[i * num_particles + idx];
-        float dx = other_state.x - state.x;
-        float dy = other_state.y - state.y;
-        float dist_sq = dx * dx + dy * dy;
-
-        if (dist_sq <= 36.0f) { // 6m radius
-          
-            Pair<Mat2, Vec2> R_t = get_affine_tx_from_state(other_state);
-            Mat2 Rc = R_t.first;
-            Vec2 tc = R_t.second;
-
-            for (int xi = 0; xi < 60; xi++) {
-                for (int yi = 0; yi < 60; yi++) {
-                    ChunkCell cell = prediction.cells[xi][yi];
-                    if (cell.num_pos == 0 && cell.num_neg == 0) continue;
-
-                    // Unquantize
-                    Vec2 cell_pos = {(float)xi * CELL_SIZE_M - 3.0f,
-                                     (float)yi * CELL_SIZE_M - 3.0f};
-
-                    Vec2 m = tc - t;
-                    Vec2 q_body = Rc.transpose() * cell_pos;
-                    Vec2 pt_body = R * (m + q_body);
-
-                    // Quantize
-                    int px = __float2int_rn((pt_body.x + 3.0f) / CELL_SIZE_M);
-                    int py = __float2int_rn((pt_body.y + 3.0f) / CELL_SIZE_M);
-
-                    if (px >= 0 && px < 60 && py >= 0 && py < 60) {
-
-                        cur_map[px][py].num_pos += cell.num_pos;
-                        cur_map[px][py].num_neg += cell.num_neg;
-
-                    }
-
-
+        
+        // Accumulate contributions from previous chunks
+        int accumulated_pos = 0;
+        int accumulated_neg = 0;
+        
+        // Unquantize cell position
+        Vec2 cell_pos = {(float)xi * CELL_SIZE_M - 3.0f, (float)yi * CELL_SIZE_M - 3.0f};
+        
+        // Loop through previous chunk states
+        for (int chunk_i = 0; chunk_i < last_chunk_index; chunk_i++) {
+            Vec3 other_state = chunk_states[chunk_i * num_particles + particle_idx];
+            float dx = other_state.x - state.x;
+            float dy = other_state.y - state.y;
+            float dist_sq = dx * dx + dy * dy;
+            
+            if (dist_sq <= 36.0f) { // 6m radius
+                Pair<Mat2, Vec2> R_t_other = get_affine_tx_from_state(other_state);
+                Mat2 Rc = R_t_other.first;
+                Vec2 tc = R_t_other.second;
+                
+                Vec2 m = tc - t;
+                Vec2 q_body = Rc.transpose() * cell_pos;
+                Vec2 pt_body = R * (m + q_body);
+                
+                // Quantize to find corresponding cell in other chunk
+                int px = __float2int_rn((pt_body.x + 3.0f) / CELL_SIZE_M);
+                int py = __float2int_rn((pt_body.y + 3.0f) / CELL_SIZE_M);
+                
+                if (px >= 0 && px < 60 && py >= 0 && py < 60) {
+                    // Accumulate from the previous chunk's cell (not the prediction chunk!)
+                    accumulated_pos += chunks[chunk_i].cells[px][py].num_pos;
+                    accumulated_neg += chunks[chunk_i].cells[px][py].num_neg;
                 }
             }
-
         }
+    
+        // Store accumulated map
+        int map_idx = particle_idx * 3600 + cell_idx;
+        cur_maps[map_idx].num_pos = accumulated_pos;
+        cur_maps[map_idx].num_neg = accumulated_neg;
     }
+}
 
-    float ll = 0.0f;
+// Compute log-likelihoods - parallelized over (particle, xi, yi)
+__global__ void computeLogLikelihoods(ChunkCell* cur_maps, Chunk* chunks, float* log_likelihoods, int num_particles, int last_chunk_index)
+{
+    // Each block handles one particle, threads loop over cells
+    int particle_idx = blockIdx.x;
+    if (particle_idx >= num_particles) return;
+    
+    // Access prediction chunk
+    Chunk prediction = chunks[last_chunk_index];
+    
+    // Grid-stride loop over cells (each thread processes multiple cells)
+    for (int cell_idx = threadIdx.x; cell_idx < 3600; cell_idx += blockDim.x) {
+        int xi = cell_idx / 60;
+        int yi = cell_idx % 60;
 
-    for (int xi = 0; xi < 60; xi++) {
-        for (int yi = 0; yi < 60; yi++) {
+        int map_idx = particle_idx * 3600 + cell_idx;
+        ChunkCell cur_cell = cur_maps[map_idx];
+        ChunkCell pred_cell = prediction.cells[xi][yi];
 
-            float p_alpha = ALPHA_PRIOR + POS_WEIGHT * prediction.cells[xi][yi].num_pos;
-            float p_beta = BETA_PRIOR + NEG_WEIGHT * prediction.cells[xi][yi].num_neg;
-
-            float p_theta = round((p_alpha) / (p_alpha + p_beta));
-            // float p_theta = (p_alpha) / (p_alpha + p_beta);
-
-            float alpha = ALPHA_PRIOR + POS_WEIGHT * cur_map[xi][yi].num_pos;
-            float beta = BETA_PRIOR + NEG_WEIGHT * cur_map[xi][yi].num_neg;
-
-            float theta = (alpha) / (alpha + beta);
-            ll += log(p_theta * theta + (1 - p_theta) * (1 - theta));
-
-
+        // Tom help? Is this correct?
+        if (pred_cell.num_pos == 0 && pred_cell.num_neg == 0) {
+            continue; // Skip empty prediction cells
         }
+        
+        // Calculate log-likelihood contribution for this cell
+        float p_alpha = ALPHA_PRIOR + POS_WEIGHT * pred_cell.num_pos;
+        float p_beta = BETA_PRIOR + NEG_WEIGHT * pred_cell.num_neg;
+        float p_theta = roundf((p_alpha) / (p_alpha + p_beta));
+        // float p_theta = (p_alpha) / (p_alpha + p_beta);
+        
+        float alpha = ALPHA_PRIOR + POS_WEIGHT * cur_cell.num_pos;
+        float beta = BETA_PRIOR + NEG_WEIGHT * cur_cell.num_neg;
+        float theta = (alpha) / (alpha + beta);
+    
+        float cell_ll = logf(p_theta * theta + (1.0f - p_theta) * (1.0f - theta));
+        
+        // Atomically add to particle's total log-likelihood
+        atomicAdd(&log_likelihoods[particle_idx], cell_ll);
     }
-
-    log_likelihoods[idx] = ll;
-
 }
 
 __global__ void calculateScores(float* log_likelihoods, float* scores_raw, float* scores, int num_particles, float min_ll, float max_ll)
@@ -339,6 +366,15 @@ int main()
         goto Error;
     }
 
+    // Allocate memory for accumulated maps (per-particle)
+    ChunkCell* d_cur_maps;
+    cudaStatus = cudaMalloc((void **)&d_cur_maps, NUM_PARTICLES * 60 * 60 * sizeof(ChunkCell));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc for cur_maps failed!");
+        goto Error;
+    }
+    std::cout << "Allocated " << NUM_PARTICLES * 60 * 60 * sizeof(ChunkCell) / (1024.0 * 1024.0) << " MB for accumulated maps." << std::endl;
+
     // Memset to 0
     cudaStatus = cudaMemset((void *)d_particles, 0, NUM_PARTICLES * MAX_TRAJECTORY_LENGTH * sizeof(Particle));
 
@@ -372,6 +408,8 @@ int main()
         
         // Allocate host memory for particles
         Particle* h_particles = new Particle[NUM_PARTICLES * MAX_TRAJECTORY_LENGTH];
+        float* h_scores = new float[NUM_PARTICLES];
+        for (int i = 0; i < NUM_PARTICLES; i++) h_scores[i] = 0.5f; // Initialize to mid-range
 
         // Load JSON data
         std::cout << "Loading bigboi_munged.json..." << std::endl;
@@ -506,22 +544,30 @@ int main()
 
                 std::cout << "Processed chunk " << cur_chunk_index << " at timestep " << chunk_timestep << " (ts=" << ts << ")" << std::endl;
 
-                // Calculate log-likelihoods for all particles for this chunk (BEFORE incrementing)
-                float* d_log_likelihoods;
-                cudaStatus = cudaMalloc((void **)&d_log_likelihoods, NUM_PARTICLES * sizeof(float));
-                if (cudaStatus != cudaSuccess) {
-                    fprintf(stderr, "cudaMalloc for log_likelihoods failed!");
-                    delete[] h_particles;
-                    goto Error;
-                }
+                // Initialize log_likelihoods to zero
+                cudaMemset(d_log_likelihoods, 0, NUM_PARTICLES * sizeof(float));
 
+                // Step 1: Accumulate maps for all particles (one block per particle)
+                // 500 blocks, 256 threads per block, each thread handles multiple cells
+                dim3 blockDim(256);
+                dim3 gridDim(NUM_PARTICLES);  // 500 blocks
+                
                 cudaEventRecord(start);
-                evaluateParticles<<<numBlocks, blockSize>>>(d_particles, d_chunks, d_chunk_states, NUM_PARTICLES, cur_chunk_index, d_log_likelihoods);
+                accumulateMapForParticles<<<gridDim, blockDim>>>(d_chunk_states, d_chunks, d_cur_maps, NUM_PARTICLES, cur_chunk_index);
                 cudaEventRecord(stop);
                 cudaEventSynchronize(stop);
-                float ms_evaluate = 0;
-                cudaEventElapsedTime(&ms_evaluate, start, stop);
-                std::cout << "  evaluateParticles: " << ms_evaluate << " ms" << std::endl;
+                float ms_accumulate = 0;
+                cudaEventElapsedTime(&ms_accumulate, start, stop);
+                std::cout << "  accumulateMapForParticles: " << ms_accumulate << " ms" << std::endl;
+
+                // Step 2: Compute log-likelihoods (parallelize over particles × cells)
+                cudaEventRecord(start);
+                computeLogLikelihoods<<<gridDim, blockDim>>>(d_cur_maps, d_chunks, d_log_likelihoods, NUM_PARTICLES, cur_chunk_index);
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float ms_likelihood = 0;
+                cudaEventElapsedTime(&ms_likelihood, start, stop);
+                std::cout << "  computeLogLikelihoods: " << ms_likelihood << " ms" << std::endl;
 
                 // Update tracking variables (AFTER evaluation)
                 last_chunk_timestamp = ts;
@@ -587,6 +633,15 @@ int main()
                 cudaEventElapsedTime(&ms_normalize, start, stop);
                 std::cout << "  normalizeScoresBySum: " << ms_normalize << " ms" << std::endl;
 
+                // Download normalized scores for visualization
+                cudaStatus = cudaMemcpy(h_scores, d_scores_raw, NUM_PARTICLES * sizeof(float), cudaMemcpyDeviceToHost);
+                if (cudaStatus != cudaSuccess) {
+                    fprintf(stderr, "cudaMemcpy for scores download failed!");
+                    delete[] h_particles;
+                    delete[] h_scores;
+                    goto Error;
+                }
+
                 // Calculate cumulative sum for resampling
                 cudaEventRecord(start);
                 calculateCumulativeSum<<<1, 1>>>(d_scores, d_cumsum, NUM_PARTICLES);
@@ -596,6 +651,9 @@ int main()
                 cudaEventElapsedTime(&ms_cumsum, start, stop);
                 std::cout << "  calculateCumulativeSum: " << ms_cumsum << " ms" << std::endl;
 
+                // for (int i = 0; i < 3; i++) {
+     
+                
                 // Generate initial random offset for SUS
                 float initial = ((float)rand() / (float)RAND_MAX) * (1.0f / (float)NUM_PARTICLES);
 
@@ -614,13 +672,7 @@ int main()
                 d_particles_swap = temp;
 
                 std::cout << "Resampled particles with initial=" << initial << std::endl;
-
-                // Print scores_raw
-                std::cout << "Scores_raw for chunk " << (cur_chunk_index - 1) << ": ";
-                for (int i = 0; i < NUM_PARTICLES; i++) {
-                    std::cout << h_scores_raw[i] << " ";
-                }
-                std::cout << std::endl;
+                // }
 
                 // Print statistics
                 float avg_ll = 0.0f;
@@ -645,10 +697,11 @@ int main()
                 if (cudaStatus != cudaSuccess) {
                     fprintf(stderr, "cudaMemcpy failed!");
                     delete[] h_particles;
+                    delete[] h_scores;
                     goto Error;
                 }
 
-                // Draw particles
+                // Draw particles with color based on score
                 int curr_timestep_mod = (timestep % MAX_TRAJECTORY_LENGTH);
                 for (int p = 0; p < NUM_PARTICLES; p++) {
                     int pos = p * MAX_TRAJECTORY_LENGTH + curr_timestep_mod;
@@ -659,7 +712,20 @@ int main()
                     int py = center_y - (int)(state.y * pixels_per_meter); // Flip y-axis for image coords
                     
                     if (px >= 0 && px < img_size && py >= 0 && py < img_size) {
-                        cv::circle(img, cv::Point(px, py), 1, cv::Scalar(200, 200, 200), -1);
+                        // Interpolate color from red (low score) to green (high score)
+                        float score = h_scores[p];
+                        float alpha = 0.1f; // Opacity for blending
+                        
+                        // Particle color: Red (BGR: 0,0,255) at score=0, Green (BGR: 0,255,0) at score=1
+                        float particle_b = 0;
+                        float particle_g = 255 * score;
+                        float particle_r = 255 * (1.0f - score);
+                        
+                        // Alpha blend: result = alpha * particle_color + (1-alpha) * existing_color
+                        cv::Vec3b& pixel = img.at<cv::Vec3b>(py, px);
+                        pixel[0] = cv::saturate_cast<uchar>(alpha * particle_b + (1.0f - alpha) * pixel[0]); // B
+                        pixel[1] = cv::saturate_cast<uchar>(alpha * particle_g + (1.0f - alpha) * pixel[1]); // G
+                        pixel[2] = cv::saturate_cast<uchar>(alpha * particle_r + (1.0f - alpha) * pixel[2]); // R
                     }
                 }
 
@@ -681,6 +747,7 @@ int main()
         std::cout << "Applied " << timestep << " steps to particles." << std::endl;
 
         delete[] h_particles;
+        delete[] h_scores;
         cv::destroyAllWindows();
         
         cudaEventDestroy(start);
@@ -697,6 +764,7 @@ Error:
     cudaFree(d_scores_raw);
     cudaFree(d_scores);
     cudaFree(d_cumsum);
+    cudaFree(d_cur_maps);
 
     return 0;
 }
