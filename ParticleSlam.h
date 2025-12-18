@@ -193,8 +193,8 @@ struct Particle {
 };
 
 struct ChunkCell {
-    int16_t num_pos;
-    int16_t num_neg;
+    uint8_t num_pos;
+    uint8_t num_neg;
 };
 
 struct Chunk {
@@ -245,6 +245,7 @@ struct KernelParams {
     float neg_weight;
     float alpha_prior;
     float beta_prior;
+    uint8_t measurement_saturation;
 };
 
 class ParticleSlam {
@@ -256,7 +257,8 @@ public:
                  float pos_weight = 0.7f,
                  float neg_weight = 0.4f,
                  float alpha_prior = 1.0f,
-                 float beta_prior = 1.5f);
+                 float beta_prior = 1.5f,
+                 uint8_t measurement_saturation = 200);
     
     ~ParticleSlam();
     

@@ -130,8 +130,15 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
         }
     
         int map_idx = particle_idx * 3600 + cell_idx;
-        cur_maps[map_idx].num_pos = accumulated_pos;
-        cur_maps[map_idx].num_neg = accumulated_neg;
+        
+        // Apply saturation with halving to maintain ratio
+        while (accumulated_pos >= params.measurement_saturation || accumulated_neg >= params.measurement_saturation) {
+            accumulated_pos /= 2;
+            accumulated_neg /= 2;
+        }
+        
+        cur_maps[map_idx].num_pos = (uint8_t)accumulated_pos;
+        cur_maps[map_idx].num_neg = (uint8_t)accumulated_neg;
     }
 }
 
@@ -143,6 +150,9 @@ __global__ void compute_log_likelihoods(ChunkCell* cur_maps, Chunk* chunks, floa
     
     
     for (int cell_idx = threadIdx.x; cell_idx < 3600; cell_idx += blockDim.x) {
+
+        // Calculating xi and yi take approximately 1/4 of the time in this kernel.
+        // We could precalculate this in shared memory and reference if needed to make this faster
         int xi = cell_idx / 60;
         int yi = cell_idx % 60;
 
@@ -426,7 +436,7 @@ __global__ void uniform_initialize_particles_kernel(Particle* particles, Map* gl
 
 ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max_chunk_length,
                            float cell_size_m, float pos_weight, float neg_weight, 
-                           float alpha_prior, float beta_prior)
+                           float alpha_prior, float beta_prior, uint8_t measurement_saturation)
     : max_chunk_length_(max_chunk_length)
     , current_timestep_(0)
     , current_chunk_index_(0)
@@ -450,6 +460,10 @@ ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max
     , d_global_map_cells_(nullptr)
     , h_global_map_(nullptr)
 {
+    if (measurement_saturation == 0 || measurement_saturation > 255) {
+        throw std::runtime_error("measurement_saturation must be between 1 and 255");
+    }
+    
     params_.num_particles = num_particles;
     params_.max_trajectory_length = max_trajectory_length;
     params_.cell_size_m = cell_size_m;
@@ -457,6 +471,7 @@ ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max
     params_.neg_weight = neg_weight;
     params_.alpha_prior = alpha_prior;
     params_.beta_prior = beta_prior;
+    params_.measurement_saturation = measurement_saturation;
 }
 
 ParticleSlam::~ParticleSlam()
@@ -978,12 +993,18 @@ Map* ParticleSlam::bake_global_map_best_particle()
                 global_y >= 0 && global_y < global_map_copy->height) {
                 int global_idx = global_y * global_map_copy->width + global_x;
                 
-                // Add observations (with saturation to prevent overflow)
+                // Add observations with saturation and halving to maintain ratio
                 int new_pos = (int)global_map_copy->cells[global_idx].num_pos + (int)best_cell.num_pos;
                 int new_neg = (int)global_map_copy->cells[global_idx].num_neg + (int)best_cell.num_neg;
                 
-                global_map_copy->cells[global_idx].num_pos = (int16_t)(new_pos > 32767 ? 32767 : new_pos);
-                global_map_copy->cells[global_idx].num_neg = (int16_t)(new_neg > 32767 ? 32767 : new_neg);
+                // Apply saturation with halving to maintain ratio
+                while (new_pos >= params_.measurement_saturation || new_neg >= params_.measurement_saturation) {
+                    new_pos /= 2;
+                    new_neg /= 2;
+                }
+                
+                global_map_copy->cells[global_idx].num_pos = (uint8_t)new_pos;
+                global_map_copy->cells[global_idx].num_neg = (uint8_t)new_neg;
             }
         }
     }
@@ -1121,8 +1142,17 @@ Map* ParticleSlam::bake_best_particle_map()
                 
                 if (map_x >= 0 && map_x < width && map_y >= 0 && map_y < height) {
                     int map_idx = map_y * width + map_x;
-                    map->cells[map_idx].num_pos += cell.num_pos;
-                    map->cells[map_idx].num_neg += cell.num_neg;
+                    int new_pos = (int)map->cells[map_idx].num_pos + (int)cell.num_pos;
+                    int new_neg = (int)map->cells[map_idx].num_neg + (int)cell.num_neg;
+                    
+                    // Apply saturation with halving to maintain ratio
+                    while (new_pos >= params_.measurement_saturation || new_neg >= params_.measurement_saturation) {
+                        new_pos /= 2;
+                        new_neg /= 2;
+                    }
+                    
+                    map->cells[map_idx].num_pos = (uint8_t)new_pos;
+                    map->cells[map_idx].num_neg = (uint8_t)new_neg;
                 }
             }
         }

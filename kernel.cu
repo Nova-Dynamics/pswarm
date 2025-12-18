@@ -174,7 +174,7 @@ int localize()
     std::cout << "Loaded " << data.size() << " entries from JSON" << std::endl;
 
     // Map* map = load_map_from_file("big_boi.bin");
-    Map* map = load_map_from_file("big_boi.bin");
+    Map* map = load_map_from_file("final_baked_map.bin");
     if (map == nullptr) {
         std::cerr << "Failed to load map from big_boi.bin" << std::endl;
         return 1;
@@ -493,7 +493,7 @@ int map()
     const int MAX_CHUNK_LENGTH = 3600;       // 1 hr at 1 Hz
     
     ParticleSlam slam(NUM_PARTICLES, MAX_TRAJECTORY_LENGTH, MAX_CHUNK_LENGTH);
-    
+        
     // Initialize the particle filter
     slam.init();
     
@@ -729,6 +729,13 @@ int map()
         cv::circle(map_img, cv::Point(end_x, end_y), 5, cv::Scalar(0, 0, 255), -1);      // Red end
     }
     
+    bool success = save_map_to_file(final_map, "final_baked_map.bin");
+    if (!success) {
+        std::cerr << "Failed to save final baked map to file!" << std::endl;
+    } else {
+        std::cout << "Final baked map saved to final_baked_map.bin" << std::endl;
+    }
+
     delete[] h_chunk_traj;
     
     cv::namedWindow("Final Baked Map", cv::WINDOW_AUTOSIZE);
@@ -745,5 +752,5 @@ int map()
 int main()
 {
     return localize();
-   //return map();
+//    return map();
 }
