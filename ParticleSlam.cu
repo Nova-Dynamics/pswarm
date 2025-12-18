@@ -81,12 +81,10 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
     Mat2 R = R_t.first;
     Vec2 t = R_t.second;
     
-    Chunk prediction = chunks[last_chunk_index];
-    
     for (int cell_idx = threadIdx.x; cell_idx < 3600; cell_idx += blockDim.x) {
         int xi = cell_idx / 60;
         int yi = cell_idx % 60;
-        ChunkCell pred_cell = prediction.cells[xi][yi];
+        ChunkCell pred_cell = chunks[last_chunk_index].cells[xi][yi];
         
         if (pred_cell.num_pos == 0 && pred_cell.num_neg == 0) {
             int map_idx = particle_idx * 3600 + cell_idx;
@@ -143,7 +141,6 @@ __global__ void compute_log_likelihoods(ChunkCell* cur_maps, Chunk* chunks, floa
     int particle_idx = blockIdx.x;
     if (particle_idx >= params.num_particles) return;
     
-    Chunk prediction = chunks[last_chunk_index];
     
     for (int cell_idx = threadIdx.x; cell_idx < 3600; cell_idx += blockDim.x) {
         int xi = cell_idx / 60;
@@ -151,7 +148,7 @@ __global__ void compute_log_likelihoods(ChunkCell* cur_maps, Chunk* chunks, floa
 
         int map_idx = particle_idx * 3600 + cell_idx;
         ChunkCell cur_cell = cur_maps[map_idx];
-        ChunkCell pred_cell = prediction.cells[xi][yi];
+        ChunkCell pred_cell = chunks[last_chunk_index].cells[xi][yi];
 
         if (pred_cell.num_pos == 0 && pred_cell.num_neg == 0) {
             continue;
@@ -914,6 +911,33 @@ void ParticleSlam::download_scores(float* h_scores) const
     
     cudaMemcpy(h_scores, d_scores_raw_, 
                params_.num_particles * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+void ParticleSlam::download_current_particle_states(Particle* h_current_states) const
+{
+    if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
+    
+    // Calculate offset to current timestep for first particle
+    int timestep_offset = current_timestep_ % params_.max_trajectory_length;
+    
+    // Use cudaMemcpy2D to copy with stride
+    // Source: d_particles_ with offset to current timestep
+    // Each "row" is one particle's current state
+    // Source pitch (stride): entire trajectory for one particle
+    // Destination pitch: contiguous array
+    cudaError_t status = cudaMemcpy2D(
+        h_current_states,                                      // dst
+        sizeof(Particle),                                      // dpitch (contiguous)
+        d_particles_ + timestep_offset,                        // src (offset to current timestep)
+        params_.max_trajectory_length * sizeof(Particle),      // spitch (stride between particles)
+        sizeof(Particle),                                      // width (bytes per particle)
+        params_.num_particles,                                 // height (number of particles)
+        cudaMemcpyDeviceToHost
+    );
+    
+    if (status != cudaSuccess) {
+        throw std::runtime_error("cudaMemcpy2D failed in download_current_particle_states");
+    }
 }
 
 Map* ParticleSlam::bake_global_map_best_particle()

@@ -144,7 +144,22 @@ cv::Scalar interpolate_hsl(cv::Scalar c1, cv::Scalar c2, float frac) {
 
 int localize()
 {
- // Load JSON data
+    // Create CUDA events for benchmarking
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    // Timing accumulators
+    float total_dr_step_time = 0.0f;
+    float total_prune_time = 0.0f;
+    float total_ingest_time = 0.0f;
+    float total_accumulate_time = 0.0f;
+    float total_resample_time = 0.0f;
+    float total_memcpy_time = 0.0f;
+    int dr_step_count = 0;
+    int measurement_count = 0;
+    
+    // Load JSON data
     std::cout << "Loading one_loop_munged.json..." << std::endl;
     std::ifstream json_file("one_loop_munged.json");
     if (!json_file.is_open()) {
@@ -159,14 +174,14 @@ int localize()
     std::cout << "Loaded " << data.size() << " entries from JSON" << std::endl;
 
     // Map* map = load_map_from_file("big_boi.bin");
-    Map* map = load_map_from_file("updated_global_map.bin");
+    Map* map = load_map_from_file("big_boi.bin");
     if (map == nullptr) {
         std::cerr << "Failed to load map from big_boi.bin" << std::endl;
         return 1;
     }
 
     // Create ParticleSlam instance with parameters
-    const int NUM_PARTICLES = 5000;
+    const int NUM_PARTICLES = 10000;
     const int MAX_TRAJECTORY_LENGTH = 300;  // 10 seconds at 30 Hz
     const int MAX_CHUNK_LENGTH = 60;
     
@@ -241,8 +256,8 @@ int localize()
     Vec3 prev_state = {0.0f, 0.0f, 0.0f};
     bool first_dr_step = true;
     
-    // Allocate host memory for particle states
-    Particle* h_particles = new Particle[NUM_PARTICLES * MAX_TRAJECTORY_LENGTH];
+    // Allocate host memory for current particle states only
+    Particle* h_particles = new Particle[NUM_PARTICLES];
     
     // Process all entries from JSON
     for (const auto& entry : data) {
@@ -263,24 +278,43 @@ int localize()
                 float theta_delta = cur_state.z - prev_state.z;
 
                 Vec3 dx_step = {mean_delta.x, mean_delta.y, theta_delta};
-                // MCL noise parameters: larger noise for localization uncertainty
-                mcl_slam.apply_step(dx_step, ts, 0.1f, 0.003f);
-
-                mcl_slam.prune_particles_outside_map();
                 
-                // Download current particle states
+                // Benchmark apply_step
+                cudaEventRecord(start);
+                mcl_slam.apply_step(dx_step, ts, 0.1f, 0.003f);
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float dr_step_ms = 0;
+                cudaEventElapsedTime(&dr_step_ms, start, stop);
+                total_dr_step_time += dr_step_ms;
+                dr_step_count++;
+
+                // Benchmark prune_particles_outside_map
+                cudaEventRecord(start);
+                mcl_slam.prune_particles_outside_map();
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float prune_ms = 0;
+                cudaEventElapsedTime(&prune_ms, start, stop);
+                total_prune_time += prune_ms;
+                
+                // Benchmark memcpy
+                cudaEventRecord(start);
+                mcl_slam.download_current_particle_states(h_particles);
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float memcpy_ms = 0;
+                cudaEventElapsedTime(&memcpy_ms, start, stop);
+                total_memcpy_time += memcpy_ms;
+                
                 int current_timestep = mcl_slam.get_current_timestep();
-                cudaMemcpy(h_particles, mcl_slam.get_d_particles(), 
-                          NUM_PARTICLES * MAX_TRAJECTORY_LENGTH * sizeof(Particle), 
-                          cudaMemcpyDeviceToHost);
                 
                 // Copy background instead of recreating it
                 cv::Mat img = background.clone();
                 
                 // Draw particles as arrows
                 for (int p = 0; p < NUM_PARTICLES; p++) {
-                    int particle_pos = p * MAX_TRAJECTORY_LENGTH + (current_timestep % MAX_TRAJECTORY_LENGTH);
-                    Particle particle = h_particles[particle_pos];
+                    Particle particle = h_particles[p];
                     
                     float x = particle.state.x;
                     float y = particle.state.y;
@@ -342,20 +376,60 @@ int localize()
             }
 
             // Ingest the chunk
+            cudaEventRecord(start);
             int c_idx = mcl_slam.ingest_visual_measurement(h_chunk);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float ingest_ms = 0;
+            cudaEventElapsedTime(&ingest_ms, start, stop);
+            total_ingest_time += ingest_ms;
 
             if (c_idx == -1) {
                 std::cerr << "Failed to ingest chunk at timestamp " << ts << std::endl;
                 continue;
             }
 
+            // Benchmark accumulate_map_from_map
+            cudaEventRecord(start);
             mcl_slam.accumulate_map_from_map(c_idx);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float accumulate_ms = 0;
+            cudaEventElapsedTime(&accumulate_ms, start, stop);
+            total_accumulate_time += accumulate_ms;
 
+            // Benchmark evaluate_and_resample
+            cudaEventRecord(start);
             mcl_slam.evaluate_and_resample(c_idx);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float resample_ms = 0;
+            cudaEventElapsedTime(&resample_ms, start, stop);
+            total_resample_time += resample_ms;
+            measurement_count++;
         }
     }
     
     delete[] h_particles;
+    
+    // Print benchmark results
+    std::cout << "\n========== BENCHMARK RESULTS ==========" << std::endl;
+    std::cout << "DR Steps: " << dr_step_count << std::endl;
+    std::cout << "  Average: " << (total_dr_step_time / dr_step_count) << " ms/step" << std::endl;
+    std::cout << "\nPrune Particles: " << dr_step_count << std::endl;
+    std::cout << "  Average: " << (total_prune_time / dr_step_count) << " ms/prune" << std::endl;
+    std::cout << "\nMemcpy (D2H): " << dr_step_count << std::endl;
+    std::cout << "  Average: " << (total_memcpy_time / dr_step_count) << " ms/copy" << std::endl;
+    std::cout << "\nMap Measurements: " << measurement_count << std::endl;
+    std::cout << "  Ingest avg: " << (total_ingest_time / measurement_count) << " ms/measurement" << std::endl;
+    std::cout << "  Accumulate avg: " << (total_accumulate_time / measurement_count) << " ms/accumulate" << std::endl;
+    std::cout << "  Resample avg: " << (total_resample_time / measurement_count) << " ms/resample" << std::endl;
+    std::cout << "\nTotal Pipeline Time: " << (total_dr_step_time + total_prune_time + total_ingest_time + total_accumulate_time + total_resample_time) << " ms" << std::endl;
+    std::cout << "========================================\n" << std::endl;
+    
+    // Cleanup CUDA events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     
     // Bake and visualize updated global map
     std::cout << "Baking updated global map from best particle..." << std::endl;
@@ -670,6 +744,6 @@ int map()
 
 int main()
 {
-   return localize();
-//    return map();
+    return localize();
+   //return map();
 }

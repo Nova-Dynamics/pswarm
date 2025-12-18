@@ -278,6 +278,7 @@ public:
     void download_chunk_states(Vec3* h_chunk_states, int max_chunks) const;
     void download_chunk_states_for_particle(Vec3* h_chunk_states, int particle_idx, int max_chunks) const;
     void download_scores(float* h_scores) const;
+    void download_current_particle_states(Particle* h_current_states) const;
     
     // State accessors
     int get_current_chunk_count() const { return current_chunk_index_; }
