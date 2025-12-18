@@ -13,6 +13,12 @@ namespace pswarm {
 // CUDA Kernels
 // ============================================================================
 
+/**
+ * @brief Initialize random number generator states for each particle
+ * @param states Device array of cuRAND states to initialize
+ * @param num_particles Total number of particles in the filter
+ * @param seed Random seed for reproducible generation
+ */
 __global__ void init_random(curandState* states, int num_particles, unsigned long long seed)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -21,6 +27,17 @@ __global__ void init_random(curandState* states, int num_particles, unsigned lon
     curand_init(seed, idx, 0, &states[idx]);
 }
 
+/**
+ * @brief Apply dead reckoning motion step with noise to all particles
+ * @param particles Device array of particle trajectories
+ * @param states Device array of cuRAND states for noise generation
+ * @param params Kernel parameters (num_particles, max_trajectory_length, etc.)
+ * @param dx_step Mean motion delta (x, y, theta)
+ * @param step_timestamp Timestamp for this step
+ * @param current_timestep Current timestep index in circular buffer
+ * @param pos_std Standard deviation for position noise
+ * @param yaw_std Standard deviation for yaw/heading noise
+ */
 __global__ void apply_step_kernel(Particle* particles, curandState* states, KernelParams params, 
                                 Vec3 dx_step, double step_timestamp, int current_timestep,
                                 float pos_std, float yaw_std)
@@ -57,6 +74,14 @@ __global__ void apply_step_kernel(Particle* particles, curandState* states, Kern
     particles[curr_pos].timestamp = step_timestamp;
 }
 
+/**
+ * @brief Extract particle states at a specific timestep for chunk association
+ * @param particles Device array of particle trajectories
+ * @param chunk_states Device array to store extracted states [chunk_index][particle_idx]
+ * @param params Kernel parameters
+ * @param timestep Timestep to extract from circular trajectory buffer
+ * @param chunk_index Index of chunk to associate with these states
+ */
 __global__ void append_particle_states_for_timestep(Particle* particles, Vec3* chunk_states, 
                                                 KernelParams params, int timestep, int chunk_index)
 {
@@ -69,6 +94,16 @@ __global__ void append_particle_states_for_timestep(Particle* particles, Vec3* c
     chunk_states[chunk_index * params.num_particles + idx] = state;
 }
 
+/**
+ * @brief Accumulate observations from previous chunks into current predicted map for each particle
+ * Transforms observations from other chunk frames into current chunk frame for map comparison
+ * @param chunk_states Device array of particle states at each chunk timestamp
+ * @param chunks Device array of visual measurement chunks
+ * @param cur_maps Output device array of accumulated maps [particle_idx][60x60 cells]
+ * @param params Kernel parameters
+ * @param last_chunk_index Index of current/latest chunk to predict
+ * @param num_valid_chunks Total number of valid chunks in circular buffer
+ */
 __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, ChunkCell* cur_maps, 
                                          KernelParams params, int last_chunk_index, int num_valid_chunks)
 {
@@ -142,6 +177,15 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
     }
 }
 
+/**
+ * @brief Compute log-likelihood score for each particle by comparing predicted vs observed map
+ * Uses Beta-Bernoulli model to score occupancy agreement
+ * @param cur_maps Device array of accumulated predicted maps [particle_idx][cells]
+ * @param chunks Device array of visual measurement chunks
+ * @param log_likelihoods Output device array of log-likelihood scores per particle
+ * @param params Kernel parameters
+ * @param last_chunk_index Index of current chunk with observations to compare
+ */
 __global__ void compute_log_likelihoods(ChunkCell* cur_maps, Chunk* chunks, float* log_likelihoods, 
                                      KernelParams params, int last_chunk_index)
 {
@@ -179,6 +223,14 @@ __global__ void compute_log_likelihoods(ChunkCell* cur_maps, Chunk* chunks, floa
     }
 }
 
+/**
+ * @brief Normalize log-likelihoods to scores in [0,1] range using min-max scaling
+ * @param log_likelihoods Device array of log-likelihood values per particle
+ * @param scores_raw Output device array of normalized scores
+ * @param num_particles Total number of particles
+ * @param min_ll Minimum log-likelihood value across all particles
+ * @param max_ll Maximum log-likelihood value across all particles
+ */
 __global__ void calculate_scores(float* log_likelihoods, float* scores_raw, 
                                int num_particles, float min_ll, float max_ll)
 {
@@ -192,6 +244,13 @@ __global__ void calculate_scores(float* log_likelihoods, float* scores_raw,
     }
 }
 
+/**
+ * @brief Normalize scores to sum to 1.0 for probability distribution
+ * @param scores_raw Device array of raw scores
+ * @param scores Output device array of normalized probability scores
+ * @param num_particles Total number of particles
+ * @param sum_scores_raw Sum of all raw scores for normalization
+ */
 __global__ void normalize_scores_by_sum(float* scores_raw, float* scores, 
                                     int num_particles, float sum_scores_raw)
 {
@@ -201,6 +260,13 @@ __global__ void normalize_scores_by_sum(float* scores_raw, float* scores,
     scores[idx] = scores_raw[idx] / sum_scores_raw;
 }
 
+/**
+ * @brief Calculate cumulative sum of scores for stochastic universal sampling
+ * Sequential operation performed by single thread
+ * @param scores Device array of normalized probability scores
+ * @param cumsum Output device array of cumulative sum values
+ * @param num_particles Total number of particles
+ */
 __global__ void calculate_cumulative_sum(float* scores, float* cumsum, int num_particles)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -211,6 +277,18 @@ __global__ void calculate_cumulative_sum(float* scores, float* cumsum, int num_p
     }
 }
 
+/**
+ * @brief Resample particles using Stochastic Universal Sampling (SUS)
+ * Duplicates high-weight particles, discards low-weight particles
+ * @param particles Device array of current particle trajectories
+ * @param particles_swap Device array for resampled particles output
+ * @param chunk_states Device array of current chunk states
+ * @param chunk_states_swap Device array for resampled chunk states output
+ * @param cumsum Device array of cumulative probability sum
+ * @param params Kernel parameters
+ * @param num_chunks Number of valid chunks to resample
+ * @param initial Random offset for SUS sampling points
+ */
 __global__ void sus_resample(Particle* particles, Particle* particles_swap, 
                            Vec3* chunk_states, Vec3* chunk_states_swap, 
                            float* cumsum, KernelParams params, int num_chunks, float initial)
@@ -241,6 +319,15 @@ __global__ void sus_resample(Particle* particles, Particle* particles_swap,
     }
 }
 
+/**
+ * @brief Accumulate observations from global reference map into predicted chunk maps
+ * Used for MCL localization against known map
+ * @param chunk_states Device array of particle states at chunk timestamps
+ * @param global_map Device pointer to global reference map
+ * @param cur_maps Output device array of predicted maps [particle_idx][cells]
+ * @param params Kernel parameters
+ * @param last_chunk_index Index of current chunk to predict for
+ */
 __global__ void accumulate_map_from_global( Vec3* chunk_states, Map* global_map, ChunkCell* cur_maps, 
                                       KernelParams params, int last_chunk_index)
 {
@@ -288,6 +375,15 @@ __global__ void accumulate_map_from_global( Vec3* chunk_states, Map* global_map,
     }
 }
 
+/**
+ * @brief Prune particles outside valid map regions and reinitialize in valid unoccupied areas
+ * Prevents particle depletion by maintaining diversity in valid regions
+ * @param particles Device array of particle trajectories
+ * @param global_map Device pointer to global reference map
+ * @param states Device array of cuRAND states for reinitialization
+ * @param params Kernel parameters
+ * @param current_timestep Current timestep index for accessing latest particle state
+ */
 __global__ void prune_particles_kernel(Particle* particles, Map* global_map, 
                                         curandState* states, KernelParams params,
                                         int current_timestep)
@@ -375,6 +471,14 @@ __global__ void prune_particles_kernel(Particle* particles, Map* global_map,
     }
 }
 
+/**
+ * @brief Compute mean pose of particle distribution using circular statistics for angles
+ * Output: Vec4(sum_x, sum_y, sum_cos_theta, sum_sin_theta) for further processing
+ * @param particles Device array of particle trajectories
+ * @param params Kernel parameters
+ * @param current_timestep Current timestep index to compute mean for
+ * @param mean_output Output device pointer to Vec4 with summed components
+ */
 __global__ void compute_mean_kernel(Particle* particles, KernelParams params, int current_timestep, Vec4* mean_output)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -427,6 +531,15 @@ __global__ void compute_mean_kernel(Particle* particles, KernelParams params, in
     }
 }
 
+/**
+ * @brief Compute full 3x3 covariance matrix for particle distribution
+ * Handles angular wrapping for theta component
+ * @param particles Device array of particle trajectories
+ * @param params Kernel parameters
+ * @param current_timestep Current timestep index
+ * @param mean Mean pose (x, y, theta) to compute deviations from
+ * @param cov_output Output device array of 9 covariance components (row-major)
+ */
 __global__ void compute_covariance_kernel(Particle* particles, KernelParams params, int current_timestep, 
                                            Vec3 mean, float* cov_output)
 {
@@ -488,6 +601,15 @@ __global__ void compute_covariance_kernel(Particle* particles, KernelParams para
     }
 }
 
+/**
+ * @brief Initialize particles uniformly across valid unoccupied regions of map
+ * Each particle samples random positions until finding valid unoccupied cell
+ * @param particles Device array of particle trajectories to initialize
+ * @param global_map Device pointer to global reference map
+ * @param states Device array of cuRAND states for random sampling
+ * @param params Kernel parameters
+ * @param initial_timestamp Initial timestamp for all particles
+ */
 __global__ void uniform_initialize_particles_kernel(Particle* particles, Map* global_map, 
                                                      curandState* states, KernelParams params,
                                                      double initial_timestamp)
@@ -547,6 +669,19 @@ __global__ void uniform_initialize_particles_kernel(Particle* particles, Map* gl
 // ParticleSlam Class Implementation
 // ============================================================================
 
+/**
+ * @brief Construct ParticleSlam filter with specified parameters
+ * @param num_particles Number of particles in the filter
+ * @param max_trajectory_length Maximum length of trajectory history per particle
+ * @param max_chunk_length Maximum number of visual measurement chunks to buffer
+ * @param cell_size_m Size of map cells in meters
+ * @param pos_weight Weight for positive observations in Beta-Bernoulli model
+ * @param neg_weight Weight for negative observations in Beta-Bernoulli model
+ * @param alpha_prior Alpha prior for Beta distribution
+ * @param beta_prior Beta prior for Beta distribution
+ * @param measurement_saturation Maximum value for observation counters (1-255)
+ * @throws std::runtime_error if measurement_saturation is invalid
+ */
 ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max_chunk_length,
                            float cell_size_m, float pos_weight, float neg_weight, 
                            float alpha_prior, float beta_prior, uint8_t measurement_saturation)
@@ -587,6 +722,9 @@ ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max
     params_.measurement_saturation = measurement_saturation;
 }
 
+/**
+ * @brief Destructor - frees all device and host memory
+ */
 ParticleSlam::~ParticleSlam()
 {
     if (initialized_) {
@@ -612,6 +750,11 @@ ParticleSlam::~ParticleSlam()
     }
 }
 
+/**
+ * @brief Initialize CUDA memory and random number generators
+ * Must be called before any other operations
+ * @param random_seed Seed for reproducible random number generation
+ */
 void ParticleSlam::init(unsigned long long random_seed)
 {
     if (initialized_) {
@@ -667,6 +810,12 @@ void ParticleSlam::init(unsigned long long random_seed)
     initialized_ = true;
 }
 
+/**
+ * @brief Set global reference map for MCL localization
+ * Copies map data to device memory and maintains host copy
+ * @param map Reference map to use for localization
+ * @throws std::runtime_error if initialization fails or not initialized
+ */
 void ParticleSlam::set_global_map(const Map& map)
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -764,6 +913,11 @@ void ParticleSlam::set_global_map(const Map& map)
               << map.width << " x " << map.height << std::endl;
 }
 
+/**
+ * @brief Initialize all particles uniformly across valid unoccupied map regions
+ * Resets timestep and chunk indexing state
+ * @throws std::runtime_error if not initialized or no global map set
+ */
 void ParticleSlam::uniform_initialize_particles()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -790,6 +944,15 @@ void ParticleSlam::uniform_initialize_particles()
     }
 }
 
+/**
+ * @brief Apply motion model step to all particles with noise
+ * Advances circular trajectory buffer and propagates particle states
+ * @param dx_step Mean motion delta (x, y, theta)
+ * @param timestamp Timestamp for this motion step
+ * @param pos_std Standard deviation for position noise
+ * @param yaw_std Standard deviation for yaw angle noise
+ * @throws std::runtime_error if not initialized
+ */
 void ParticleSlam::apply_step(Vec3 dx_step, double timestamp, float pos_std, float yaw_std)
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -810,6 +973,11 @@ void ParticleSlam::apply_step(Vec3 dx_step, double timestamp, float pos_std, flo
     cudaDeviceSynchronize();
 }
 
+/**
+ * @brief Accumulate predicted map from trajectory history for SLAM mode
+ * Transforms previous observations into current frame for each particle
+ * @param chunk_index Index of chunk to predict map for
+ */
 void ParticleSlam::accumulate_map_from_trajectories(int chunk_index)
 {
     dim3 blockDim(256);
@@ -825,6 +993,12 @@ void ParticleSlam::accumulate_map_from_trajectories(int chunk_index)
     cudaDeviceSynchronize();
 }
 
+/**
+ * @brief Accumulate predicted map from global reference map for MCL mode
+ * Projects global map into chunk frame for each particle hypothesis
+ * @param chunk_index Index of chunk to predict map for
+ * @throws std::runtime_error if no global map set
+ */
 void ParticleSlam::accumulate_map_from_map(int chunk_index)
 {
     
@@ -840,6 +1014,11 @@ void ParticleSlam::accumulate_map_from_map(int chunk_index)
     cudaDeviceSynchronize();
 }
 
+/**
+ * @brief Prune particles outside valid map and reinitialize in valid regions
+ * Prevents particle filter degradation by maintaining diversity
+ * @throws std::runtime_error if not initialized or no global map set
+ */
 void ParticleSlam::prune_particles_outside_map()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -859,6 +1038,11 @@ void ParticleSlam::prune_particles_outside_map()
 }
 
 
+/**
+ * @brief Evaluate particle likelihoods and resample using Stochastic Universal Sampling
+ * Computes weights, normalizes, and resamples to maintain effective particle count
+ * @param chunk_index Index of chunk used for evaluation
+ */
 void ParticleSlam::evaluate_and_resample(int chunk_index)
 {
     cudaMemset(d_log_likelihoods_, 0, params_.num_particles * sizeof(float));
@@ -933,6 +1117,13 @@ void ParticleSlam::evaluate_and_resample(int chunk_index)
     d_chunk_states_swap_ = temp_chunks;
 }
 
+/**
+ * @brief Ingest new visual measurement chunk and associate with particle states
+ * Finds matching timestep and stores chunk in circular buffer
+ * @param chunk Visual measurement chunk with observations and timestamp
+ * @return Index where chunk was stored, or -1 on error
+ * @throws std::runtime_error if not initialized
+ */
 int ParticleSlam::ingest_visual_measurement(const Chunk& chunk)
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -989,6 +1180,12 @@ int ParticleSlam::ingest_visual_measurement(const Chunk& chunk)
     return returned_index;
 }
 
+/**
+ * @brief Download particle states at all chunk timestamps for visualization
+ * @param h_chunk_states Host array to receive states [chunk][particle] layout
+ * @param max_chunks Maximum number of chunks to download
+ * @throws std::runtime_error if not initialized or download fails
+ */
 void ParticleSlam::download_chunk_states(Vec3* h_chunk_states, int max_chunks) const
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1005,6 +1202,13 @@ void ParticleSlam::download_chunk_states(Vec3* h_chunk_states, int max_chunks) c
     }
 }
 
+/**
+ * @brief Download trajectory of single particle across all chunk timestamps
+ * @param h_chunk_states Host array to receive trajectory states
+ * @param particle_idx Index of particle to download (0 to num_particles-1)
+ * @param max_chunks Maximum number of chunks to download
+ * @throws std::runtime_error if not initialized, invalid index, or download fails
+ */
 void ParticleSlam::download_chunk_states_for_particle(Vec3* h_chunk_states, int particle_idx, int max_chunks) const
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1033,6 +1237,11 @@ void ParticleSlam::download_chunk_states_for_particle(Vec3* h_chunk_states, int 
     delete[] h_all_chunk_states;
 }
 
+/**
+ * @brief Download raw particle scores from last evaluation
+ * @param h_scores Host array to receive scores (size: num_particles)
+ * @throws std::runtime_error if not initialized
+ */
 void ParticleSlam::download_scores(float* h_scores) const
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1041,6 +1250,12 @@ void ParticleSlam::download_scores(float* h_scores) const
                params_.num_particles * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
+/**
+ * @brief Download current particle states efficiently using strided memory copy
+ * Uses cudaMemcpy2D to extract current timestep without copying full trajectories
+ * @param h_current_states Host array to receive current states (size: num_particles)
+ * @throws std::runtime_error if not initialized or copy fails
+ */
 void ParticleSlam::download_current_particle_states(Particle* h_current_states) const
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1068,6 +1283,12 @@ void ParticleSlam::download_current_particle_states(Particle* h_current_states) 
     }
 }
 
+/**
+ * @brief Calculate mean, covariance, and Gaussianity test for particle distribution
+ * Computes statistics on x,y position (skipping theta for Gaussianity test)
+ * @return Measurement struct containing mean pose, 3x3 covariance, and Gaussianity flag
+ * @throws std::runtime_error if not initialized
+ */
 Measurement ParticleSlam::calculate_measurement()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1147,6 +1368,12 @@ Measurement ParticleSlam::calculate_measurement()
     return result;
 }
 
+/**
+ * @brief Merge best particle's map with global reference map
+ * Creates updated global map by adding best particle observations
+ * @return New map containing merged observations (caller must delete)
+ * @throws std::runtime_error if not initialized or no global map set
+ */
 Map* ParticleSlam::bake_global_map_best_particle()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1207,6 +1434,12 @@ Map* ParticleSlam::bake_global_map_best_particle()
     return global_map_copy;
 }
 
+/**
+ * @brief Generate map from highest-scoring particle's trajectory
+ * Transforms all chunk observations into common reference frame
+ * @return New map containing best particle observations (caller must delete)
+ * @throws std::runtime_error if not initialized or no chunks ingested
+ */
 Map* ParticleSlam::bake_best_particle_map()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
@@ -1376,6 +1609,13 @@ Map* ParticleSlam::bake_best_particle_map()
 #define MAP_FILE_MAGIC 0x4D415053  // "MAPS" in ASCII
 #define MAP_FILE_VERSION 1
 
+/**
+ * @brief Save map to binary file with custom format
+ * Format: magic number, version, header size, dimensions, bounds, cell data
+ * @param map Pointer to map to save
+ * @param filename Path to output file
+ * @return true on success, false on failure
+ */
 bool save_map_to_file(const Map* map, const char* filename) {
     if (!map || !map->cells || map->width <= 0 || map->height <= 0) {
         fprintf(stderr, "save_map_to_file: Invalid map\n");
@@ -1430,6 +1670,12 @@ bool save_map_to_file(const Map* map, const char* filename) {
     }
 }
 
+/**
+ * @brief Load map from binary file
+ * Reads header, validates format, allocates and populates map structure
+ * @param filename Path to input file
+ * @return Pointer to loaded map (caller must delete), or nullptr on failure
+ */
 Map* load_map_from_file(const char* filename) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {

@@ -297,14 +297,39 @@ struct KernelParams {
     uint8_t measurement_saturation;
 };
 
+/**
+ * @brief Statistical measurement of particle distribution
+ * Contains mean pose, covariance matrix, and Gaussianity test result
+ */
 struct Measurement {
-    Mat3 covariance;
-    Vec3 mean;
-    bool is_gaussian;
+    Mat3 covariance;    ///< 3x3 covariance matrix (x, y, theta)
+    Vec3 mean;          ///< Mean pose (x, y, theta)
+    bool is_gaussian;   ///< True if distribution passes 2D Gaussianity test on (x,y)
 };
 
+/**
+ * @brief GPU-accelerated particle filter for SLAM and MCL localization
+ * 
+ * Supports two modes:
+ * - SLAM: Build map from scratch using particle trajectories
+ * - MCL (Monte Carlo Localization): Localize against known reference map
+ * 
+ * Uses Beta-Bernoulli observation model with stochastic universal sampling.
+ */
 class ParticleSlam {
 public:
+    /**
+     * @brief Construct particle filter with specified parameters
+     * @param num_particles Number of particles in the filter
+     * @param max_trajectory_length Maximum trajectory history per particle
+     * @param max_chunk_length Maximum number of visual measurement chunks to buffer
+     * @param cell_size_m Size of map cells in meters (default: 0.1m)
+     * @param pos_weight Weight for positive observations in Beta-Bernoulli model
+     * @param neg_weight Weight for negative observations in Beta-Bernoulli model
+     * @param alpha_prior Alpha prior for Beta distribution
+     * @param beta_prior Beta prior for Beta distribution
+     * @param measurement_saturation Max value for observation counters (1-255, default: 200)
+     */
     ParticleSlam(int num_particles, 
                  int max_trajectory_length, 
                  int max_chunk_length,
@@ -315,49 +340,142 @@ public:
                  float beta_prior = 1.5f,
                  uint8_t measurement_saturation = 200);
     
+    /**
+     * @brief Destructor - frees all device and host memory
+     */
     ~ParticleSlam();
     
-    // Initialize and allocate memory
+    /**
+     * @brief Initialize CUDA memory and random number generators
+     * Must be called before any other operations
+     * @param random_seed Seed for reproducible random number generation (default: 1234)
+     */
     void init(unsigned long long random_seed = 1234ULL);
     
-    // Apply a dead reckoning step with configurable process noise
-    // pos_std: standard deviation for position noise (multiplicative)
-    // yaw_std: standard deviation for yaw noise (additive)
+    /**
+     * @brief Apply dead reckoning motion step to all particles with noise
+     * Propagates particles forward using motion model with configurable process noise
+     * @param dx_step Mean motion delta (x, y, theta)
+     * @param timestamp Timestamp for this step
+     * @param pos_std Standard deviation for position noise (default: 1.6e-3)
+     * @param yaw_std Standard deviation for yaw angle noise (default: 1e-3)
+     */
     void apply_step(Vec3 dx_step, double timestamp, float pos_std = 1.6e-3f, float yaw_std = 1e-3f);
     
-    // Ingest a visual measurement chunk
+    /**
+     * @brief Ingest new visual measurement chunk and associate with particle states
+     * Finds matching timestep in trajectory buffer and stores chunk
+     * @param chunk Visual measurement chunk (60x60 occupancy grid with timestamp)
+     * @return Index where chunk was stored, or -1 on error
+     */
     int ingest_visual_measurement(const Chunk& chunk);
     
+    /**
+     * @brief Evaluate particle likelihoods and resample using Stochastic Universal Sampling
+     * Computes observation likelihoods, normalizes weights, and resamples particles
+     * @param chunk_index Index of chunk to use for evaluation
+     */
     void evaluate_and_resample(int chunk_index);
 
 
-    // Download functions for visualization
+    /**
+     * @brief Download particle states at all chunk timestamps for visualization
+     * @param h_chunk_states Host array to receive states [chunk][particle] layout
+     * @param max_chunks Maximum number of chunks to download
+     */
     void download_chunk_states(Vec3* h_chunk_states, int max_chunks) const;
+    
+    /**
+     * @brief Download trajectory of single particle across all chunk timestamps
+     * @param h_chunk_states Host array to receive trajectory states
+     * @param particle_idx Index of particle to download (0 to num_particles-1)
+     * @param max_chunks Maximum number of chunks to download
+     */
     void download_chunk_states_for_particle(Vec3* h_chunk_states, int particle_idx, int max_chunks) const;
+    
+    /**
+     * @brief Download raw particle scores from last evaluation
+     * @param h_scores Host array to receive scores (size: num_particles)
+     */
     void download_scores(float* h_scores) const;
+    
+    /**
+     * @brief Download current particle states efficiently using strided memory copy
+     * Uses cudaMemcpy2D to extract current timestep without copying full trajectories
+     * @param h_current_states Host array to receive current states (size: num_particles)
+     */
     void download_current_particle_states(Particle* h_current_states) const;
     
-    // State accessors
+    /** @brief Get current chunk count (number of chunks ingested) */
     int get_current_chunk_count() const { return current_chunk_index_; }
+    
+    /** @brief Get current timestep index in circular trajectory buffer */
     int get_current_timestep() const { return current_timestep_; }
+    
+    /** @brief Get number of particles in filter */
     int get_num_particles() const { return params_.num_particles; }
+    
+    /** @brief Get device pointer to particle array (advanced use only) */
     Particle* get_d_particles() const { return d_particles_; }
 
-    // Create accumulated map from best particle
+    /**
+     * @brief Generate map from highest-scoring particle's trajectory (SLAM mode)
+     * Transforms all chunk observations into common reference frame
+     * @return New map containing best particle observations (caller must delete)
+     */
     Map* bake_best_particle_map();
 
-    // Mapping specific functions ==========================
+    // ========== SLAM Mode Functions ==========
+    
+    /**
+     * @brief Accumulate predicted map from trajectory history for SLAM mode
+     * Transforms previous observations into current frame for each particle
+     * @param chunk_index Index of chunk to predict map for
+     */
     void accumulate_map_from_trajectories(int chunk_index);
 
 
-    // Localization specific functions ======================
+    // ========== MCL Localization Mode Functions ==========
+    
+    /**
+     * @brief Accumulate predicted map from global reference map for MCL mode
+     * Projects global map into chunk frame for each particle hypothesis
+     * @param chunk_index Index of chunk to predict map for
+     */
     void accumulate_map_from_map(int chunk_index);
+    
+    /**
+     * @brief Set global reference map for MCL localization
+     * Copies map data to device memory and maintains host copy
+     * @param map Reference map to use for localization
+     */
     void set_global_map(const Map& map);
+    
+    /**
+     * @brief Initialize all particles uniformly across valid unoccupied map regions
+     * Required for MCL mode startup. Resets timestep and chunk indexing state.
+     */
     void uniform_initialize_particles();
+    
+    /**
+     * @brief Prune particles outside valid map and reinitialize in valid regions
+     * Prevents particle filter degradation by maintaining diversity
+     */
     void prune_particles_outside_map();
+    
+    /**
+     * @brief Merge best particle's map with global reference map
+     * Creates updated global map by adding best particle observations
+     * @return New map containing merged observations (caller must delete)
+     */
     Map* bake_global_map_best_particle();
     
-    // Statistics functions
+    /**
+     * @brief Calculate mean, covariance, and Gaussianity test for particle distribution
+     * Uses circular statistics for angle mean. Gaussianity test uses Mahalanobis distance
+     * on 2D position (x,y) only, expecting ~39% within 1-sigma for healthy Gaussian.
+     * @return Measurement struct containing mean pose, 3x3 covariance, and Gaussianity flag
+     */
     Measurement calculate_measurement();
     
 private:
@@ -392,7 +510,21 @@ private:
 
 };
 
+/**
+ * @brief Load map from binary file
+ * Reads header, validates format, allocates and populates map structure
+ * @param filename Path to input file
+ * @return Pointer to loaded map (caller must delete), or nullptr on failure
+ */
 Map* load_map_from_file(const char* filename);
+
+/**
+ * @brief Save map to binary file with custom format
+ * Format: magic number, version, header size, dimensions, bounds, cell data
+ * @param map Pointer to map to save
+ * @param filename Path to output file
+ * @return true on success, false on failure
+ */
 bool save_map_to_file(const Map* map, const char* filename);
 
 } // namespace pswarm
