@@ -669,6 +669,6 @@ int map()
 
 int main()
 {
-   return localize();
-   //return map();
+//    return localize();
+   return map();
 }

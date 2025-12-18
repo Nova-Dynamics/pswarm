@@ -96,8 +96,10 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
         int accumulated_pos = 0;
         int accumulated_neg = 0;
         
-        Vec2 cell_pos = {(float)xi * params.cell_size_m - 3.0f, 
-                        (float)yi * params.cell_size_m - 3.0f};
+        Vec2 quantized_cell = {(float)xi, (float)yi};
+        Vec2 cell_pos = dequantize_pt(quantized_cell, params.cell_size_m);
+        cell_pos.x -= 3.0f;
+        cell_pos.y -= 3.0f;
         
         // Loop through all valid chunks except the current one
         for (int i = 0; i < num_valid_chunks - 1; i++) {
@@ -115,8 +117,10 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
                 Vec2 q_body = Rc.transpose() * cell_pos;
                 Vec2 pt_body = R * (m + q_body);
                 
-                int px = __float2int_rn((pt_body.x + 3.0f) / params.cell_size_m);
-                int py = __float2int_rn((pt_body.y + 3.0f) / params.cell_size_m);
+                Vec2 pt_body_offset = {pt_body.x + 3.0f, pt_body.y + 3.0f};
+                Vec2 quantized = quantize_pt(pt_body_offset, params.cell_size_m);
+                int px = (int)quantized.x;
+                int py = (int)quantized.y;
                 
                 if (px >= 0 && px < 60 && py >= 0 && py < 60) {
                     accumulated_pos += chunks[i].cells[px][py].num_pos;
@@ -243,15 +247,19 @@ __global__ void accumulate_map_from_global( Vec3* chunk_states, Map* global_map,
         int yi = cell_idx % 60;
         
         // Cell position in chunk frame (unquantized)
-        Vec2 cell_pos_chunk = {(float)xi * params.cell_size_m - 3.0f, 
-                              (float)yi * params.cell_size_m - 3.0f};
+        Vec2 quantized_cell = {(float)xi, (float)yi};
+        Vec2 cell_pos_chunk = dequantize_pt(quantized_cell, params.cell_size_m);
+        cell_pos_chunk.x -= 3.0f;
+        cell_pos_chunk.y -= 3.0f;
         
         // Transform to global/reference frame using body2map
         Vec2 cell_pos_global = body2map(state, cell_pos_chunk);
         
         // Quantize to global map grid
-        int map_x = __float2int_rn((cell_pos_global.x - global_map->min_x) / global_map->cell_size);
-        int map_y = __float2int_rn((cell_pos_global.y - global_map->min_y) / global_map->cell_size);
+        Vec2 relative_pos = {cell_pos_global.x - global_map->min_x, cell_pos_global.y - global_map->min_y};
+        Vec2 quantized = quantize_pt(relative_pos, global_map->cell_size);
+        int map_x = (int)quantized.x;
+        int map_y = (int)quantized.y;
         
         // Check if position is within global map bounds
         if (map_x >= 0 && map_x < global_map->width && map_y >= 0 && map_y < global_map->height) {
@@ -286,8 +294,11 @@ __global__ void prune_particles_kernel(Particle* particles, Map* global_map,
     float x = latest_particle.state.x;
     float y = latest_particle.state.y;
     
-    int map_x = __float2int_rn((x - global_map->min_x) / global_map->cell_size);
-    int map_y = __float2int_rn((y - global_map->min_y) / global_map->cell_size);
+    Vec2 particle_pos = {x, y};
+    Vec2 relative_pos = {x - global_map->min_x, y - global_map->min_y};
+    Vec2 quantized = quantize_pt(relative_pos, global_map->cell_size);
+    int map_x = (int)quantized.x;
+    int map_y = (int)quantized.y;
     
     bool needs_reinit = false;
     
@@ -322,8 +333,10 @@ __global__ void prune_particles_kernel(Particle* particles, Map* global_map,
             proposed_theta = curand_uniform(&states[idx]) * 2.0f * 3.14159265359f;
             
             // Quantize position to map grid
-            int new_map_x = __float2int_rn((proposed_x - global_map->min_x) / global_map->cell_size);
-            int new_map_y = __float2int_rn((proposed_y - global_map->min_y) / global_map->cell_size);
+            Vec2 proposed_relative = {proposed_x - global_map->min_x, proposed_y - global_map->min_y};
+            Vec2 proposed_quantized = quantize_pt(proposed_relative, global_map->cell_size);
+            int new_map_x = (int)proposed_quantized.x;
+            int new_map_y = (int)proposed_quantized.y;
             
             // Check if position is within map bounds
             if (new_map_x >= 0 && new_map_x < global_map->width && new_map_y >= 0 && new_map_y < global_map->height) {
@@ -377,8 +390,10 @@ __global__ void uniform_initialize_particles_kernel(Particle* particles, Map* gl
         proposed_theta = curand_uniform(&states[idx]) * 2.0f * 3.14159265359f;
         
         // Quantize position to map grid
-        int map_x = __float2int_rn((proposed_x - global_map->min_x) / global_map->cell_size);
-        int map_y = __float2int_rn((proposed_y - global_map->min_y) / global_map->cell_size);
+        Vec2 proposed_relative = {proposed_x - global_map->min_x, proposed_y - global_map->min_y};
+        Vec2 proposed_quantized = quantize_pt(proposed_relative, global_map->cell_size);
+        int map_x = (int)proposed_quantized.x;
+        int map_y = (int)proposed_quantized.y;
         
         // Check if position is within map bounds
         if (map_x >= 0 && map_x < global_map->width && map_y >= 0 && map_y < global_map->height) {
@@ -921,12 +936,16 @@ Map* ParticleSlam::bake_global_map_best_particle()
             if (best_cell.num_pos == 0 && best_cell.num_neg == 0) continue;
             
             // Calculate world position of this cell
-            float world_x = best_map->min_x + best_x * best_map->cell_size;
-            float world_y = best_map->min_y + best_y * best_map->cell_size;
+            Vec2 quantized_pos = {(float)best_x, (float)best_y};
+            Vec2 relative_pos = dequantize_pt(quantized_pos, best_map->cell_size);
+            float world_x = best_map->min_x + relative_pos.x;
+            float world_y = best_map->min_y + relative_pos.y;
             
             // Find corresponding cell in global map
-            int global_x = (int)roundf((world_x - global_map_copy->min_x) / global_map_copy->cell_size);
-            int global_y = (int)roundf((world_y - global_map_copy->min_y) / global_map_copy->cell_size);
+            Vec2 world_pos_relative = {world_x - global_map_copy->min_x, world_y - global_map_copy->min_y};
+            Vec2 global_quantized = quantize_pt(world_pos_relative, global_map_copy->cell_size);
+            int global_x = (int)global_quantized.x;
+            int global_y = (int)global_quantized.y;
             
             // Check if within global map bounds
             if (global_x >= 0 && global_x < global_map_copy->width && 
@@ -1007,8 +1026,10 @@ Map* ParticleSlam::bake_best_particle_map()
                 if (cell.num_pos == 0 && cell.num_neg == 0) continue;
                 
                 // Cell position in chunk frame (unquantized)
-                Vec2 cell_pos_chunk = {(float)xi * params_.cell_size_m - 3.0f, 
-                                      (float)yi * params_.cell_size_m - 3.0f};
+                Vec2 quantized_cell = {(float)xi, (float)yi};
+                Vec2 cell_pos_chunk = dequantize_pt(quantized_cell, params_.cell_size_m);
+                cell_pos_chunk.x -= 3.0f;
+                cell_pos_chunk.y -= 3.0f;
                 
                 // Transform to reference frame using body2map
                 Vec2 cell_pos_ref = body2map(chunk_state, cell_pos_chunk);
@@ -1058,15 +1079,19 @@ Map* ParticleSlam::bake_best_particle_map()
                 if (cell.num_pos == 0 && cell.num_neg == 0) continue;
                 
                 // Cell position in chunk frame (unquantized)
-                Vec2 cell_pos_chunk = {(float)xi * params_.cell_size_m - 3.0f, 
-                                      (float)yi * params_.cell_size_m - 3.0f};
+                Vec2 quantized_cell = {(float)xi, (float)yi};
+                Vec2 cell_pos_chunk = dequantize_pt(quantized_cell, params_.cell_size_m);
+                cell_pos_chunk.x -= 3.0f;
+                cell_pos_chunk.y -= 3.0f;
                 
                 // Transform to reference frame using body2map
                 Vec2 cell_pos_ref = body2map(chunk_state, cell_pos_chunk);
                 
                 // Quantize to map grid
-                int map_x = (int)roundf((cell_pos_ref.x - min_x) / params_.cell_size_m);
-                int map_y = (int)roundf((cell_pos_ref.y - min_y) / params_.cell_size_m);
+                Vec2 ref_relative = {cell_pos_ref.x - min_x, cell_pos_ref.y - min_y};
+                Vec2 ref_quantized = quantize_pt(ref_relative, params_.cell_size_m);
+                int map_x = (int)ref_quantized.x;
+                int map_y = (int)ref_quantized.y;
                 
                 if (map_x >= 0 && map_x < width && map_y >= 0 && map_y < height) {
                     int map_idx = map_y * width + map_x;
