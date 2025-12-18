@@ -124,6 +124,55 @@ __host__ __device__ inline Vec3 operator*(const Mat3& a, const Vec3& v) {
     return result;
 }
 
+struct Vec4 {
+    float x, y, z, w;
+
+    __host__ __device__ Vec4 operator+(Vec4 v) const { return { x + v.x, y + v.y, z + v.z, w + v.w }; }
+    __host__ __device__ Vec4 operator-(Vec4 v) const { return { x - v.x, y - v.y, z - v.z, w - v.w }; }
+    __host__ __device__ Vec4 operator*(float s) const { return { x * s, y * s, z * s, w * s }; }
+    __host__ __device__ float dot(Vec4 v) const { return x * v.x + y * v.y + z * v.z + w * v.w; }
+    __host__ __device__ float length() const { return sqrtf(x * x + y * y + z * z + w * w); }
+};
+
+struct Mat4 {
+    float m[16];
+
+    __host__ __device__ float& operator()(int r, int c) { return m[r * 4 + c]; }
+    __host__ __device__ const float& operator()(int r, int c) const { return m[r * 4 + c]; }
+
+    __host__ __device__ Mat4 transpose() const {
+        Mat4 result;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                result(i, j) = (*this)(j, i);
+            }
+        }
+
+        return result;
+    }
+};
+
+__host__ __device__ inline Mat4 operator*(const Mat4& a, const Mat4& b) {
+    Mat4 result;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            result(i, j) = a(i, 0) * b(0, j) + a(i, 1) * b(1, j) + a(i, 2) * b(2, j) + a(i, 3) * b(3, j);
+        }
+    }
+
+    return result;
+}
+
+__host__ __device__ inline Vec4 operator*(const Mat4& a, const Vec4& v) {
+    Vec4 result{};
+    result.x = a(0, 0) * v.x + a(0, 1) * v.y + a(0, 2) * v.z + a(0, 3) * v.w;
+    result.y = a(1, 0) * v.x + a(1, 1) * v.y + a(1, 2) * v.z + a(1, 3) * v.w;
+    result.z = a(2, 0) * v.x + a(2, 1) * v.y + a(2, 2) * v.z + a(2, 3) * v.w;
+    result.w = a(3, 0) * v.x + a(3, 1) * v.y + a(3, 2) * v.z + a(3, 3) * v.w;
+
+    return result;
+}
+
 __host__ __device__ inline Mat2 get_R_from_theta(float theta) {
     Mat2 R{};
 
@@ -248,6 +297,12 @@ struct KernelParams {
     uint8_t measurement_saturation;
 };
 
+struct Measurement {
+    Mat3 covariance;
+    Vec3 mean;
+    bool is_gaussian;
+};
+
 class ParticleSlam {
 public:
     ParticleSlam(int num_particles, 
@@ -301,6 +356,9 @@ public:
     void uniform_initialize_particles();
     void prune_particles_outside_map();
     Map* bake_global_map_best_particle();
+    
+    // Statistics functions
+    Measurement calculate_measurement();
     
 private:
     // Parameters

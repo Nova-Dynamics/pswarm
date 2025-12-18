@@ -375,6 +375,119 @@ __global__ void prune_particles_kernel(Particle* particles, Map* global_map,
     }
 }
 
+__global__ void compute_mean_kernel(Particle* particles, KernelParams params, int current_timestep, Vec4* mean_output)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Use shared memory for reduction
+    __shared__ float sum_x[256];
+    __shared__ float sum_y[256];
+    __shared__ float sum_cos_z[256];
+    __shared__ float sum_sin_z[256];
+    
+    float local_x = 0.0f;
+    float local_y = 0.0f;
+    float local_cos_z = 0.0f;
+    float local_sin_z = 0.0f;
+    
+    // Each thread accumulates multiple particles
+    for (int i = idx; i < params.num_particles; i += blockDim.x * gridDim.x) {
+        int particle_pos = i * params.max_trajectory_length + (current_timestep % params.max_trajectory_length);
+        Particle p = particles[particle_pos];
+        
+        local_x += p.state.x;
+        local_y += p.state.y;
+        local_cos_z += cosf(p.state.z);
+        local_sin_z += sinf(p.state.z);
+    }
+    
+    sum_x[threadIdx.x] = local_x;
+    sum_y[threadIdx.x] = local_y;
+    sum_cos_z[threadIdx.x] = local_cos_z;
+    sum_sin_z[threadIdx.x] = local_sin_z;
+    __syncthreads();
+    
+    // Reduce within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_x[threadIdx.x] += sum_x[threadIdx.x + stride];
+            sum_y[threadIdx.x] += sum_y[threadIdx.x + stride];
+            sum_cos_z[threadIdx.x] += sum_cos_z[threadIdx.x + stride];
+            sum_sin_z[threadIdx.x] += sum_sin_z[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes block result to Vec4
+    if (threadIdx.x == 0) {
+        atomicAdd(&mean_output[0].x, sum_x[0]);
+        atomicAdd(&mean_output[0].y, sum_y[0]);
+        atomicAdd(&mean_output[0].z, sum_cos_z[0]);
+        atomicAdd(&mean_output[0].w, sum_sin_z[0]);
+    }
+}
+
+__global__ void compute_covariance_kernel(Particle* particles, KernelParams params, int current_timestep, 
+                                           Vec3 mean, float* cov_output)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Use shared memory for reduction of 9 covariance components
+    __shared__ float sum_cov[9][256];
+    
+    float local_cov[9] = {0};
+    
+    // Each thread accumulates multiple particles
+    for (int i = idx; i < params.num_particles; i += blockDim.x * gridDim.x) {
+        int particle_pos = i * params.max_trajectory_length + (current_timestep % params.max_trajectory_length);
+        Particle p = particles[particle_pos];
+        
+        // Compute deviations from mean
+        float dx = p.state.x - mean.x;
+        float dy = p.state.y - mean.y;
+        
+        // For theta, compute angular difference (shortest path)
+        float dtheta = p.state.z - mean.z;
+        // Normalize to [-pi, pi]
+        while (dtheta > 3.14159265359f) dtheta -= 2.0f * 3.14159265359f;
+        while (dtheta < -3.14159265359f) dtheta += 2.0f * 3.14159265359f;
+        
+        // Accumulate covariance terms: Cov(i,j) = E[(xi - μi)(xj - μj)]
+        local_cov[0] += dx * dx;      // Cov(x, x)
+        local_cov[1] += dx * dy;      // Cov(x, y)
+        local_cov[2] += dx * dtheta;  // Cov(x, theta)
+        local_cov[3] += dy * dx;      // Cov(y, x)
+        local_cov[4] += dy * dy;      // Cov(y, y)
+        local_cov[5] += dy * dtheta;  // Cov(y, theta)
+        local_cov[6] += dtheta * dx;  // Cov(theta, x)
+        local_cov[7] += dtheta * dy;  // Cov(theta, y)
+        local_cov[8] += dtheta * dtheta; // Cov(theta, theta)
+    }
+    
+    // Store in shared memory
+    for (int k = 0; k < 9; k++) {
+        sum_cov[k][threadIdx.x] = local_cov[k];
+    }
+    __syncthreads();
+    
+    // Reduce within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            for (int k = 0; k < 9; k++) {
+                sum_cov[k][threadIdx.x] += sum_cov[k][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes block result
+    if (threadIdx.x == 0) {
+        for (int k = 0; k < 9; k++) {
+            atomicAdd(&cov_output[k], sum_cov[k][0]);
+        }
+    }
+}
+
 __global__ void uniform_initialize_particles_kernel(Particle* particles, Map* global_map, 
                                                      curandState* states, KernelParams params,
                                                      double initial_timestamp)
@@ -953,6 +1066,86 @@ void ParticleSlam::download_current_particle_states(Particle* h_current_states) 
     if (status != cudaSuccess) {
         throw std::runtime_error("cudaMemcpy2D failed in download_current_particle_states");
     }
+}
+
+Measurement ParticleSlam::calculate_measurement()
+{
+    if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
+    
+    Measurement result;
+    
+    // Allocate device memory for mean computation (single Vec4 for x, y, cos_z, sin_z)
+    Vec4* d_mean_temp;
+    cudaMalloc(&d_mean_temp, sizeof(Vec4));
+    cudaMemset(d_mean_temp, 0, sizeof(Vec4));
+    
+    // Launch kernel to compute mean
+    int blockSize = 256;
+    int numBlocks = (params_.num_particles + blockSize - 1) / blockSize;
+    numBlocks = (numBlocks > 32) ? 32 : numBlocks;  // Limit to 32 blocks for atomic operations
+    
+    compute_mean_kernel<<<numBlocks, blockSize>>>(d_particles_, params_, current_timestep_, d_mean_temp);
+    cudaDeviceSynchronize();
+    
+    // Download mean results
+    Vec4 h_mean_temp;
+    cudaMemcpy(&h_mean_temp, d_mean_temp, sizeof(Vec4), cudaMemcpyDeviceToHost);
+    cudaFree(d_mean_temp);
+    
+    // Compute final mean
+    float n = (float)params_.num_particles;
+    result.mean.x = h_mean_temp.x / n;
+    result.mean.y = h_mean_temp.y / n;
+    
+    // Compute mean angle using atan2 of averaged sin/cos
+    float mean_cos = h_mean_temp.z / n;
+    float mean_sin = h_mean_temp.w / n;
+    result.mean.z = atan2f(mean_sin, mean_cos);
+    
+    // Calculate covariance matrix
+    float* d_cov_temp;
+    cudaMalloc(&d_cov_temp, 9 * sizeof(float));
+    cudaMemset(d_cov_temp, 0, 9 * sizeof(float));
+    
+    compute_covariance_kernel<<<numBlocks, blockSize>>>(d_particles_, params_, current_timestep_, result.mean, d_cov_temp);
+    cudaDeviceSynchronize();
+    
+    // Download covariance
+    float h_cov_temp[9];
+    cudaMemcpy(h_cov_temp, d_cov_temp, 9 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_cov_temp);
+    
+    // Compute final covariance (divide by n)
+    for (int i = 0; i < 9; i++) {
+        h_cov_temp[i] /= n;
+    }
+    
+    // Store in Mat3
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            result.covariance(i, j) = h_cov_temp[i * 3 + j];
+        }
+    }
+    
+
+    
+     Vec2 eigvals{};
+
+    float diag_avg = (result.covariance(0, 0) + result.covariance(1, 1)) / 2;
+    float det = (result.covariance(0, 0) * result.covariance(1, 1) - result.covariance(0, 1) * result.covariance(1, 0));
+
+    // This should be larger than eigvals.y
+    eigvals.x = diag_avg + std::sqrt(std::pow(diag_avg, 2) - det);
+    eigvals.y = diag_avg - std::sqrt(std::pow(diag_avg, 2) - det);
+
+
+    if (eigvals.x < 0.2f) {
+        result.is_gaussian = true;
+    } else {
+        result.is_gaussian = false;
+    }
+    
+    return result;
 }
 
 Map* ParticleSlam::bake_global_map_best_particle()

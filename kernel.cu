@@ -156,6 +156,7 @@ int localize()
     float total_accumulate_time = 0.0f;
     float total_resample_time = 0.0f;
     float total_memcpy_time = 0.0f;
+    float total_measurement_time = 0.0f;
     int dr_step_count = 0;
     int measurement_count = 0;
     
@@ -298,6 +299,15 @@ int localize()
                 cudaEventElapsedTime(&prune_ms, start, stop);
                 total_prune_time += prune_ms;
                 
+                // Benchmark calculate_measurement
+                cudaEventRecord(start);
+                Measurement measurement = mcl_slam.calculate_measurement();
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float measurement_ms = 0;
+                cudaEventElapsedTime(&measurement_ms, start, stop);
+                total_measurement_time += measurement_ms;
+                
                 // Benchmark memcpy
                 cudaEventRecord(start);
                 mcl_slam.download_current_particle_states(h_particles);
@@ -334,6 +344,58 @@ int localize()
                     
                     // Draw small circle at particle position
                     cv::circle(img, cv::Point(px, py), 2, cv::Scalar(0, 0, 255), -1);
+                }
+                
+                // Draw mean pose as a larger arrow (blue if Gaussian, orange if not)
+                {
+                    float mean_x = measurement.mean.x;
+                    float mean_y = measurement.mean.y;
+                    float mean_theta = measurement.mean.z;
+                    
+                    int mean_px = center_x + (int)(mean_x * pixels_per_meter);
+                    int mean_py = center_y - (int)(mean_y * pixels_per_meter);
+                    
+                    // Color: blue if Gaussian, orange if not
+                    cv::Scalar arrow_color = measurement.is_gaussian ? cv::Scalar(255, 0, 0) : cv::Scalar(0, 165, 255);
+                    cv::Scalar circle_color = measurement.is_gaussian ? cv::Scalar(200, 0, 0) : cv::Scalar(0, 140, 255);
+                    
+                    // Draw covariance ellipse (1-sigma) for x,y
+                    float cov_xx = measurement.covariance(0, 0);
+                    float cov_xy = measurement.covariance(0, 1);
+                    float cov_yy = measurement.covariance(1, 1);
+                    
+                    // Compute eigenvalues for ellipse axes
+                    float trace = cov_xx + cov_yy;
+                    float det = cov_xx * cov_yy - cov_xy * cov_xy;
+                    float discriminant = sqrtf(trace * trace / 4.0f - det);
+                    float lambda1 = trace / 2.0f + discriminant;
+                    float lambda2 = trace / 2.0f - discriminant;
+                    
+                    // Ellipse axes lengths (3-sigma)
+                    float axis1 = sqrtf(lambda1) * 3 * pixels_per_meter;
+                    float axis2 = sqrtf(lambda2) * 3 * pixels_per_meter;
+                    
+                    // Rotation angle
+                    float angle_rad = 0.5f * atan2f(2.0f * cov_xy, cov_xx - cov_yy);
+                    float angle_deg = angle_rad * 180.0f / 3.14159265359f;
+                    
+                    // Draw ellipse
+                    cv::ellipse(img, cv::Point(mean_px, mean_py), 
+                              cv::Size((int)axis1, (int)axis2), 
+                              angle_deg, 0, 360, arrow_color, 2, cv::LINE_AA);
+                    
+                    // Larger arrow for mean
+                    float arrow_length = 0.6f; // 60cm arrow
+                    int arrow_px = (int)(arrow_length * -sinf(-mean_theta) * pixels_per_meter);
+                    int arrow_py = -(int)(arrow_length * cosf(-mean_theta) * pixels_per_meter);
+                    
+                    // Draw arrow with thicker line
+                    cv::arrowedLine(img, cv::Point(mean_px, mean_py), 
+                                  cv::Point(mean_px + arrow_px, mean_py + arrow_py),
+                                  arrow_color, 3, cv::LINE_AA, 0, 0.3);
+                    
+                    // Draw larger circle at mean position
+                    cv::circle(img, cv::Point(mean_px, mean_py), 5, circle_color, -1);
                 }
                 
                 // Draw info
@@ -418,6 +480,8 @@ int localize()
     std::cout << "  Average: " << (total_dr_step_time / dr_step_count) << " ms/step" << std::endl;
     std::cout << "\nPrune Particles: " << dr_step_count << std::endl;
     std::cout << "  Average: " << (total_prune_time / dr_step_count) << " ms/prune" << std::endl;
+    std::cout << "\nCalculate Measurement: " << dr_step_count << std::endl;
+    std::cout << "  Average: " << (total_measurement_time / dr_step_count) << " ms/calculation" << std::endl;
     std::cout << "\nMemcpy (D2H): " << dr_step_count << std::endl;
     std::cout << "  Average: " << (total_memcpy_time / dr_step_count) << " ms/copy" << std::endl;
     std::cout << "\nMap Measurements: " << measurement_count << std::endl;
