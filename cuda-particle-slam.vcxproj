@@ -83,7 +83,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ParticleSlam.h" />
-    <ClInclude Include="rt_jr.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

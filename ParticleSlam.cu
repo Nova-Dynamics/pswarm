@@ -7,6 +7,8 @@
 #include <fstream>
 #include <cfloat>
 
+namespace pswarm {
+
 // ============================================================================
 // CUDA Kernels
 // ============================================================================
@@ -1274,3 +1276,5 @@ Map* load_map_from_file(const char* filename) {
         return nullptr;
     }
 }
+
+} // namespace pswarm

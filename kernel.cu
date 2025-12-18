@@ -9,6 +9,7 @@
 #include "ParticleSlam.h"
 
 using json = nlohmann::json;
+using namespace pswarm;
 
 // ============================================================================
 // HSL Color Interpolation Functions
@@ -669,6 +670,6 @@ int map()
 
 int main()
 {
-//    return localize();
-   return map();
+   return localize();
+//    return map();
 }
