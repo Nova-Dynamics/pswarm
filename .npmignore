@@ -1,18 +1,8 @@
-# Exclude development files
-kernel.cu
-kernelBackup.cu
-x64/
-*.vcxproj*
 bigboi_munged.json
-one-loop_munged.json
-*.sln
-*.ncu-rep
-.vs/
-.vscode/
-
-# Exclude build artifacts that will be rebuilt
-build/Debug/
-build/obj.target/
-
-# Include only necessary build outputs
-!build/Release/
+one_loop_munged.json
+x64/
+*.bin
+node_modules/
+build/
+dist/
+*.vcxproj*

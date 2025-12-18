@@ -161,10 +161,10 @@ int localize()
     int measurement_count = 0;
     
     // Load JSON data
-    std::cout << "Loading one_loop_munged.json..." << std::endl;
-    std::ifstream json_file("one_loop_munged.json");
+    std::cout << "Loading ./examples/data/partial_run.json..." << std::endl;
+    std::ifstream json_file("./examples/data/partial_run.json");
     if (!json_file.is_open()) {
-        fprintf(stderr, "Failed to open one_loop_munged.json!\n");
+        fprintf(stderr, "Failed to open ./examples/data/partial_run.json!\n");
         return 1;
     }
     
@@ -175,9 +175,9 @@ int localize()
     std::cout << "Loaded " << data.size() << " entries from JSON" << std::endl;
 
     // Map* map = load_map_from_file("big_boi.bin");
-    Map* map = load_map_from_file("final_baked_map.bin");
+    Map* map = load_map_from_file("./examples/data/baked_map.bin");
     if (map == nullptr) {
-        std::cerr << "Failed to load map from big_boi.bin" << std::endl;
+        std::cerr << "Failed to load map from baked_map.bin" << std::endl;
         return 1;
     }
 
@@ -582,10 +582,10 @@ int map()
     Vec3* h_chunk_states = new Vec3[MAX_CHUNK_LENGTH * NUM_PARTICLES];
 
     // Load JSON data
-    std::cout << "Loading bigboi_munged.json..." << std::endl;
-    std::ifstream json_file("bigboi_munged.json");
+    std::cout << "Loading ./examples/data/full_run.json..." << std::endl;
+    std::ifstream json_file("./examples/data/full_run.json");
     if (!json_file.is_open()) {
-        fprintf(stderr, "Failed to open bigboi_munged.json!\n");
+        fprintf(stderr, "Failed to open ./examples/data/full_run.json!\n");
         delete[] h_scores;
         delete[] h_chunk_states;
         return 1;
@@ -793,11 +793,11 @@ int map()
         cv::circle(map_img, cv::Point(end_x, end_y), 5, cv::Scalar(0, 0, 255), -1);      // Red end
     }
     
-    bool success = save_map_to_file(final_map, "final_baked_map.bin");
+    bool success = save_map_to_file(final_map, "./examples/data/baked_map.bin");
     if (!success) {
         std::cerr << "Failed to save final baked map to file!" << std::endl;
     } else {
-        std::cout << "Final baked map saved to final_baked_map.bin" << std::endl;
+        std::cout << "Final baked map saved to ./examples/data/baked_map.bin" << std::endl;
     }
 
     delete[] h_chunk_traj;
@@ -815,6 +815,6 @@ int map()
 
 int main()
 {
-    return localize();
-//    return map();
+    //return localize();
+    return map();
 }
