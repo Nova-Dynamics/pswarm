@@ -2,3 +2,6 @@ bigboi_munged.json
 one_loop_munged.json
 x64/
 *.bin
+node_modules/
+build/
+dist/

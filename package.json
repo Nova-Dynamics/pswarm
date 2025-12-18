@@ -1,0 +1,27 @@
+{
+  "name": "@novadynamics/pswarm",
+  "version": "1.0.0",
+  "description": "GPU-accelerated particle filter for SLAM and MCL localization",
+  "main": "index.js",
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp configure build",
+    "clean": "node-gyp clean"
+  },
+  "keywords": [
+    "slam",
+    "particle-filter",
+    "cuda",
+    "localization",
+    "robotics"
+  ],
+  "author": "Nova Dynamics",
+  "license": "MIT",
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  }
+}
