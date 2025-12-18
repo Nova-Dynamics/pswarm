@@ -156,6 +156,15 @@ namespace rt_jr {
         return qpt;
     }
 
+    __host__ __device__ inline Vec2 dequantize_pt(Vec2 qpt, float cell_width) {
+        Vec2 pt{};
+
+        pt.x = qpt.x * cell_width;
+        pt.y = qpt.y * cell_width;
+
+        return pt;
+    }
+
     __host__ __device__ inline Vec2 body2map(Vec3 body_state_map, Vec2 body_pt) {
         Mat2 R{};
         Vec2 body_state_pos{ body_state_map.x, body_state_map.y };

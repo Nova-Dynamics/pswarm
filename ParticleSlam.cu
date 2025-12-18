@@ -68,7 +68,7 @@ __global__ void append_particle_states_for_timestep(Particle* particles, Vec3* c
 }
 
 __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, ChunkCell* cur_maps, 
-                                         KernelParams params, int last_chunk_index)
+                                         KernelParams params, int last_chunk_index, int num_valid_chunks)
 {
     int particle_idx = blockIdx.x;
     if (particle_idx >= params.num_particles) return;
@@ -99,8 +99,9 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
         Vec2 cell_pos = {(float)xi * params.cell_size_m - 3.0f, 
                         (float)yi * params.cell_size_m - 3.0f};
         
-        for (int chunk_i = 0; chunk_i < last_chunk_index; chunk_i++) {
-            Vec3 other_state = chunk_states[chunk_i * params.num_particles + particle_idx];
+        // Loop through all valid chunks except the current one
+        for (int i = 0; i < num_valid_chunks - 1; i++) {
+            Vec3 other_state = chunk_states[i * params.num_particles + particle_idx];
             float dx = other_state.x - state.x;
             float dy = other_state.y - state.y;
             float dist_sq = dx * dx + dy * dy;
@@ -118,8 +119,8 @@ __global__ void accumulate_map_for_particles(Vec3* chunk_states, Chunk* chunks, 
                 int py = __float2int_rn((pt_body.y + 3.0f) / params.cell_size_m);
                 
                 if (px >= 0 && px < 60 && py >= 0 && py < 60) {
-                    accumulated_pos += chunks[chunk_i].cells[px][py].num_pos;
-                    accumulated_neg += chunks[chunk_i].cells[px][py].num_neg;
+                    accumulated_pos += chunks[i].cells[px][py].num_pos;
+                    accumulated_neg += chunks[i].cells[px][py].num_neg;
                 }
             }
         }
@@ -419,6 +420,7 @@ ParticleSlam::ParticleSlam(int num_particles, int max_trajectory_length, int max
     , first_step_(true)
     , initialized_(false)
     , has_global_map_(false)
+    , chunks_wrapped_(false)
     , d_particles_(nullptr)
     , d_particles_swap_(nullptr)
     , d_chunk_states_(nullptr)
@@ -630,6 +632,7 @@ void ParticleSlam::uniform_initialize_particles()
     current_chunk_index_ = 0;
     last_chunk_timestamp_ = -1.0;
     first_step_ = true;
+    chunks_wrapped_ = false;
     
     // Launch kernel to initialize particles uniformly across unoccupied areas
     int blockSize = 256;
@@ -670,9 +673,12 @@ void ParticleSlam::accumulate_map_from_trajectories(int chunk_index)
     dim3 blockDim(256);
     dim3 gridDim(params_.num_particles);
     
+    // Determine number of valid chunks
+    int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : (chunk_index + 1);
+    
     // Accumulate maps
     accumulate_map_for_particles<<<gridDim, blockDim>>>(
-        d_chunk_states_, d_chunks_, d_accumulated_maps, params_, chunk_index);
+        d_chunk_states_, d_chunks_, d_accumulated_maps, params_, chunk_index, num_valid_chunks);
 
     cudaDeviceSynchronize();
 }
@@ -767,9 +773,12 @@ void ParticleSlam::evaluate_and_resample(int chunk_index)
     // Resample
     float initial = ((float)rand() / (float)RAND_MAX) * (1.0f / (float)params_.num_particles);
     
+    // Number of valid chunks for resampling
+    int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : (chunk_index + 1);
+    
     sus_resample<<<numBlocks, blockSize>>>(
         d_particles_, d_particles_swap_, d_chunk_states_, d_chunk_states_swap_, 
-        d_cumsum_, params_, chunk_index + 1, initial);
+        d_cumsum_, params_, num_valid_chunks, initial);
     cudaDeviceSynchronize();
     
     // Swap pointers
@@ -824,16 +833,27 @@ int ParticleSlam::ingest_visual_measurement(const Chunk& chunk)
     cudaDeviceSynchronize();
     
     last_chunk_timestamp_ = chunk.timestamp;
+    
+    // Store the chunk index to return before incrementing
+    int returned_index = current_chunk_index_;
+    
+    // Increment and wrap chunk index
     current_chunk_index_++;
+    if (current_chunk_index_ >= max_chunk_length_) {
+        current_chunk_index_ = 0;
+        chunks_wrapped_ = true;
+    }
 
-    return current_chunk_index_ - 1;
+    return returned_index;
 }
 
 void ParticleSlam::download_chunk_states(Vec3* h_chunk_states, int max_chunks) const
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
     
-    int num_chunks = (max_chunks < current_chunk_index_) ? max_chunks : current_chunk_index_;
+    // Determine actual number of valid chunks
+    int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : current_chunk_index_;
+    int num_chunks = (max_chunks < num_valid_chunks) ? max_chunks : num_valid_chunks;
     
     cudaError_t status = cudaMemcpy(h_chunk_states, d_chunk_states_, 
                                      num_chunks * params_.num_particles * sizeof(Vec3), 
@@ -849,7 +869,9 @@ void ParticleSlam::download_chunk_states_for_particle(Vec3* h_chunk_states, int 
     if (particle_idx < 0 || particle_idx >= params_.num_particles) 
         throw std::runtime_error("Invalid particle index");
     
-    int num_chunks = (max_chunks < current_chunk_index_) ? max_chunks : current_chunk_index_;
+    // Determine actual number of valid chunks
+    int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : current_chunk_index_;
+    int num_chunks = (max_chunks < num_valid_chunks) ? max_chunks : num_valid_chunks;
     
     // Download all chunk states then extract the particle we want
     Vec3* h_all_chunk_states = new Vec3[num_chunks * params_.num_particles];
@@ -877,10 +899,63 @@ void ParticleSlam::download_scores(float* h_scores) const
                params_.num_particles * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
+Map* ParticleSlam::bake_global_map_best_particle()
+{
+    if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
+    if (!has_global_map_) throw std::runtime_error("Global map not set for localization");
+    
+    // Bake best particle map
+    Map* best_map = bake_best_particle_map();
+
+    // Copy host global map
+    Map* global_map_copy = new Map(*h_global_map_);
+
+    // Merge best particle map into global_map_copy (both on host)
+    // For each cell in best_map, add its observations to the corresponding global map cell
+    for (int best_y = 0; best_y < best_map->height; best_y++) {
+        for (int best_x = 0; best_x < best_map->width; best_x++) {
+            int best_idx = best_y * best_map->width + best_x;
+            ChunkCell best_cell = best_map->cells[best_idx];
+            
+            // Skip cells with no observations
+            if (best_cell.num_pos == 0 && best_cell.num_neg == 0) continue;
+            
+            // Calculate world position of this cell
+            float world_x = best_map->min_x + best_x * best_map->cell_size;
+            float world_y = best_map->min_y + best_y * best_map->cell_size;
+            
+            // Find corresponding cell in global map
+            int global_x = (int)roundf((world_x - global_map_copy->min_x) / global_map_copy->cell_size);
+            int global_y = (int)roundf((world_y - global_map_copy->min_y) / global_map_copy->cell_size);
+            
+            // Check if within global map bounds
+            if (global_x >= 0 && global_x < global_map_copy->width && 
+                global_y >= 0 && global_y < global_map_copy->height) {
+                int global_idx = global_y * global_map_copy->width + global_x;
+                
+                // Add observations (with saturation to prevent overflow)
+                int new_pos = (int)global_map_copy->cells[global_idx].num_pos + (int)best_cell.num_pos;
+                int new_neg = (int)global_map_copy->cells[global_idx].num_neg + (int)best_cell.num_neg;
+                
+                global_map_copy->cells[global_idx].num_pos = (int16_t)(new_pos > 32767 ? 32767 : new_pos);
+                global_map_copy->cells[global_idx].num_neg = (int16_t)(new_neg > 32767 ? 32767 : new_neg);
+            }
+        }
+    }
+    
+    // Clean up best_map
+    delete best_map;
+
+    return global_map_copy;
+}
+
 Map* ParticleSlam::bake_best_particle_map()
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
-    if (current_chunk_index_ == 0) throw std::runtime_error("No chunks ingested yet");
+    
+    // Determine actual number of valid chunks
+    int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : current_chunk_index_;
+    if (num_valid_chunks == 0) throw std::runtime_error("No chunks ingested yet");
     
     // Download scores to find best particle
     float* h_scores = new float[params_.num_particles];
@@ -898,9 +973,9 @@ Map* ParticleSlam::bake_best_particle_map()
     delete[] h_scores;
     
     // Download all chunk states
-    Vec3* h_all_chunk_states = new Vec3[current_chunk_index_ * params_.num_particles];
+    Vec3* h_all_chunk_states = new Vec3[num_valid_chunks * params_.num_particles];
     cudaError_t status = cudaMemcpy(h_all_chunk_states, d_chunk_states_, 
-                                     current_chunk_index_ * params_.num_particles * sizeof(Vec3), 
+                                     num_valid_chunks * params_.num_particles * sizeof(Vec3), 
                                      cudaMemcpyDeviceToHost);
     if (status != cudaSuccess) {
         delete[] h_all_chunk_states;
@@ -908,21 +983,21 @@ Map* ParticleSlam::bake_best_particle_map()
     }
     
     // Extract chunk states for best particle
-    Vec3* h_chunk_states = new Vec3[current_chunk_index_];
-    for (int chunk_i = 0; chunk_i < current_chunk_index_; chunk_i++) {
+    Vec3* h_chunk_states = new Vec3[num_valid_chunks];
+    for (int chunk_i = 0; chunk_i < num_valid_chunks; chunk_i++) {
         h_chunk_states[chunk_i] = h_all_chunk_states[chunk_i * params_.num_particles + best_particle_idx];
     }
     delete[] h_all_chunk_states;
     
     // Download all chunks
-    Chunk* h_chunks = new Chunk[current_chunk_index_];
-    cudaMemcpy(h_chunks, d_chunks_, current_chunk_index_ * sizeof(Chunk), cudaMemcpyDeviceToHost);
+    Chunk* h_chunks = new Chunk[num_valid_chunks];
+    cudaMemcpy(h_chunks, d_chunks_, num_valid_chunks * sizeof(Chunk), cudaMemcpyDeviceToHost);
     
     // First pass: find bounds by transforming all chunk cells to reference frame
     float min_x = FLT_MAX, min_y = FLT_MAX;
     float max_x = -FLT_MAX, max_y = -FLT_MAX;
     
-    for (int chunk_i = 0; chunk_i < current_chunk_index_; chunk_i++) {
+    for (int chunk_i = 0; chunk_i < num_valid_chunks; chunk_i++) {
         Vec3 chunk_state = h_chunk_states[chunk_i];
         
         // Transform from chunk frame to reference frame
@@ -974,7 +1049,7 @@ Map* ParticleSlam::bake_best_particle_map()
     }
     
     // Second pass: accumulate cells into map
-    for (int chunk_i = 0; chunk_i < current_chunk_index_; chunk_i++) {
+    for (int chunk_i = 0; chunk_i < num_valid_chunks; chunk_i++) {
         Vec3 chunk_state = h_chunk_states[chunk_i];
         
         for (int xi = 0; xi < 60; xi++) {

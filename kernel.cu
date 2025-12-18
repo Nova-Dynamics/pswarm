@@ -157,16 +157,17 @@ int localize()
     
     std::cout << "Loaded " << data.size() << " entries from JSON" << std::endl;
 
-    Map* map = load_map_from_file("big_boi.bin");
+    // Map* map = load_map_from_file("big_boi.bin");
+    Map* map = load_map_from_file("updated_global_map.bin");
     if (map == nullptr) {
         std::cerr << "Failed to load map from big_boi.bin" << std::endl;
         return 1;
     }
 
     // Create ParticleSlam instance with parameters
-    const int NUM_PARTICLES = 1000;
+    const int NUM_PARTICLES = 5000;
     const int MAX_TRAJECTORY_LENGTH = 300;  // 10 seconds at 30 Hz
-    const int MAX_CHUNK_LENGTH = 5;     // TODO: FIX WRAPAROUND
+    const int MAX_CHUNK_LENGTH = 60;
     
     ParticleSlam mcl_slam(NUM_PARTICLES, MAX_TRAJECTORY_LENGTH, MAX_CHUNK_LENGTH);
     
@@ -350,12 +351,58 @@ int localize()
             mcl_slam.accumulate_map_from_map(c_idx);
 
             mcl_slam.evaluate_and_resample(c_idx);
-
-            // TODO: Prune particles that go off the map
         }
     }
     
     delete[] h_particles;
+    
+    // Bake and visualize updated global map
+    std::cout << "Baking updated global map from best particle..." << std::endl;
+    Map* updated_map = mcl_slam.bake_global_map_best_particle();
+
+    save_map_to_file(updated_map, "updated_global_map.bin");
+    
+    if (updated_map != nullptr) {
+        // Create image for map visualization
+        int pixels_per_cell = 5;
+        int map_img_width = updated_map->width * pixels_per_cell;
+        int map_img_height = updated_map->height * pixels_per_cell;
+        cv::Mat map_img(map_img_height, map_img_width, CV_8UC3, cv::Scalar(255, 255, 255));
+        
+        // Draw each cell with color
+        for (int y = 0; y < updated_map->height; y++) {
+            for (int x = 0; x < updated_map->width; x++) {
+                int idx = y * updated_map->width + x;
+                ChunkCell cell = updated_map->cells[idx];
+                
+                int total_obs = cell.num_pos + cell.num_neg;
+                if (total_obs > 1) {
+                    // Calculate occupancy probability
+                    float alpha = 1.0f + 0.7f * cell.num_pos;
+                    float beta = 1.5f + 0.4f * cell.num_neg;
+                    float prob = alpha / (alpha + beta);
+                    
+                    // Color using HSL interpolation from black to orange
+                    cv::Scalar start(0, 0, 0);       // Black
+                    cv::Scalar stop(0, 165, 255);    // Orange (BGR)
+                    cv::Scalar color = interpolate_hsl(start, stop, prob);
+                    
+                    cv::rectangle(map_img, 
+                                cv::Point(x * pixels_per_cell, (updated_map->height - 1 - y) * pixels_per_cell), 
+                                cv::Point((x + 1) * pixels_per_cell, (updated_map->height - y) * pixels_per_cell),
+                                color, -1);
+                }
+            }
+        }
+        
+        cv::namedWindow("Updated Global Map", cv::WINDOW_AUTOSIZE);
+        cv::imshow("Updated Global Map", map_img);
+        std::cout << "Updated map displayed. Press any key to close..." << std::endl;
+        cv::waitKey(0);
+        
+        delete updated_map;
+    }
+    
     delete map;
     
     cv::destroyAllWindows();

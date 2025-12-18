@@ -3,6 +3,7 @@
 #include "rt_jr.hpp"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstring>
 
 using namespace rt_jr;
 
@@ -34,6 +35,22 @@ struct Map {
     
     Map() : cells(nullptr), width(0), height(0), 
             min_x(0), min_y(0), max_x(0), max_y(0), cell_size(0.1f) {}
+
+    // Copy constructor - deep copy
+    Map(const Map& other)
+        : width(other.width), height(other.height),
+        min_x(other.min_x), min_y(other.min_y),
+        max_x(other.max_x), max_y(other.max_y),
+        cell_size(other.cell_size)
+    {
+        if (other.cells && width > 0 && height > 0) {
+            size_t num_cells = static_cast<size_t>(width) * static_cast<size_t>(height);
+            cells = new ChunkCell[num_cells];
+            memcpy(cells, other.cells, num_cells * sizeof(ChunkCell));
+        } else {
+            cells = nullptr;
+        }
+    }
     
     ~Map() {
         if (cells) delete[] cells;
@@ -100,6 +117,7 @@ public:
     void set_global_map(const Map& map);
     void uniform_initialize_particles();
     void prune_particles_outside_map();
+    Map* bake_global_map_best_particle();
     
 private:
     // Parameters
@@ -129,8 +147,9 @@ private:
     bool first_step_;
     bool initialized_;
     bool has_global_map_;
+    bool chunks_wrapped_;  // True if current_chunk_index_ has wrapped around
 
 };
 
 Map* load_map_from_file(const char* filename);
-bool save_map_to_file(const Map& map, const char* filename);
+bool save_map_to_file(const Map* map, const char* filename);
