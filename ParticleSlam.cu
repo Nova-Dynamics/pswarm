@@ -1138,7 +1138,6 @@ Measurement ParticleSlam::calculate_measurement()
     eigvals.x = diag_avg + std::sqrt(std::pow(diag_avg, 2) - det);
     eigvals.y = diag_avg - std::sqrt(std::pow(diag_avg, 2) - det);
 
-
     if (eigvals.x < 0.2f) {
         result.is_gaussian = true;
     } else {

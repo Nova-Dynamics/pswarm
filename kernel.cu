@@ -182,7 +182,7 @@ int localize()
     }
 
     // Create ParticleSlam instance with parameters
-    const int NUM_PARTICLES = 10000;
+    const int NUM_PARTICLES = 5000;
     const int MAX_TRAJECTORY_LENGTH = 300;  // 10 seconds at 30 Hz
     const int MAX_CHUNK_LENGTH = 60;
     
@@ -356,8 +356,8 @@ int localize()
                     int mean_py = center_y - (int)(mean_y * pixels_per_meter);
                     
                     // Color: blue if Gaussian, orange if not
-                    cv::Scalar arrow_color = measurement.is_gaussian ? cv::Scalar(255, 0, 0) : cv::Scalar(0, 165, 255);
-                    cv::Scalar circle_color = measurement.is_gaussian ? cv::Scalar(200, 0, 0) : cv::Scalar(0, 140, 255);
+                    cv::Scalar arrow_color = measurement.is_gaussian ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
+                    cv::Scalar circle_color = measurement.is_gaussian ? cv::Scalar(0, 200, 0) : cv::Scalar(0, 140, 255);
                     
                     // Draw covariance ellipse (1-sigma) for x,y
                     float cov_xx = measurement.covariance(0, 0);
