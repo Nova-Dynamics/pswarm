@@ -2,6 +2,8 @@
 
 A high-performance particle filter implementation for Simultaneous Localization and Mapping (SLAM) and Monte Carlo Localization (MCL) using CUDA and exposed as a Node.js native addon.
 
+**⚠️ Linux Only**: This project only supports Linux with NVIDIA GPUs. Windows is not supported.
+
 ## Overview
 
 This project implements a GPU-accelerated particle filter that can perform both:
@@ -24,12 +26,11 @@ The core algorithms run on CUDA-enabled GPUs for real-time performance with thou
 ## Requirements
 
 ### System Requirements
+- **Linux Operating System** (Ubuntu 20.04+ recommended, WSL2 supported)
 - **NVIDIA GPU** with CUDA support (Compute Capability 3.5+)
-- **CUDA Toolkit** (10.0 or later)
-- **Node.js** (14.x or later recommended)
-- **C++ Compiler**:
-  - Linux: GCC 7+ (with C++14 support)
-  - Windows: Visual Studio 2017+ or MSVC
+- **CUDA Toolkit** 10.0 or later (installed at `/usr/local/cuda`)
+- **Node.js** 14.x or later recommended
+- **GCC** 7+ with C++14 support
 
 ### Dependencies
 - `node-addon-api`: For Node.js native addon support
@@ -41,17 +42,25 @@ The core algorithms run on CUDA-enabled GPUs for real-time performance with thou
 
 Download and install the CUDA Toolkit from [NVIDIA's website](https://developer.nvidia.com/cuda-downloads).
 
-**Linux:**
+**Ubuntu/Debian:**
 ```bash
-# Ubuntu/Debian
+# Add NVIDIA package repositories
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.pin
 sudo mv cuda-ubuntu2004.pin /etc/apt/preferences.d/cuda-repository-pin-600
-# Follow NVIDIA's installation guide for your distribution
+wget https://developer.download.nvidia.com/compute/cuda/12.0.0/local_installers/cuda-repo-ubuntu2004-12-0-local_12.0.0-525.60.13-1_amd64.deb
+sudo dpkg -i cuda-repo-ubuntu2004-12-0-local_12.0.0-525.60.13-1_amd64.deb
+sudo cp /var/cuda-repo-ubuntu2004-12-0-local/cuda-*-keyring.gpg /usr/share/keyrings/
+sudo apt-get update
+sudo apt-get -y install cuda
+
+# Verify CUDA installation
+/usr/local/cuda/bin/nvcc --version
 ```
 
-**Windows:**
-- Download and run the CUDA installer
-- Set environment variable: `CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.x`
+Ensure CUDA is installed at `/usr/local/cuda`. If installed elsewhere, create a symlink:
+```bash
+sudo ln -s /usr/local/cuda-12.0 /usr/local/cuda
+```
 
 ### 2. Install Node.js Dependencies
 
@@ -61,15 +70,8 @@ npm install
 
 ### 3. Build the Native Addon
 
-**Linux:**
 ```bash
 npx node-gyp configure
-npx node-gyp build
-```
-
-**Windows:**
-```bash
-npx node-gyp configure --msvs_version=2019
 npx node-gyp build
 ```
 
@@ -345,18 +347,22 @@ Typical performance on an NVIDIA RTX 3080 with 10,000 particles:
 ### Build Issues
 
 **Error: `nvcc: command not found`**
-- Ensure CUDA Toolkit is installed
-- Add CUDA bin directory to PATH:
-  - Linux: `export PATH=/usr/local/cuda/bin:$PATH`
-  - Windows: Add `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.x\bin` to PATH
+- Ensure CUDA Toolkit is installed at `/usr/local/cuda`
+- Verify nvcc is accessible: `/usr/local/cuda/bin/nvcc --version`
+- If CUDA is installed elsewhere, create a symlink:
+  ```bash
+  sudo ln -s /path/to/cuda /usr/local/cuda
+  ```
 
 **Error: `undefined symbol: _ZN6pswarm...`**
-- Ensure CUDA runtime libraries are in library path:
-  - Linux: `export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH`
-  - Or add `-Wl,-rpath,/usr/local/cuda/lib64` to ldflags in binding.gyp
+- The build system automatically sets rpath to `/usr/local/cuda/lib64`
+- If issues persist, manually add to library path:
+  ```bash
+  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+  ```
 
-**Error: `gyp: Call to 'node -p ...' returned exit status 1`**
-- Check that regex escaping in binding.gyp is correct (4 backslashes for Windows paths)
+**Error: Building on Windows**
+- Windows is not supported. Use Linux or WSL2 (Windows Subsystem for Linux 2)
 
 ### Runtime Issues
 
@@ -416,13 +422,28 @@ Contributions are welcome! Areas for improvement:
 
 ## License
 
-[Specify your license here]
+MIT License
+
+Copyright (c) 2025
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## Acknowledgments
 
 This implementation uses CUDA for GPU acceleration and is designed for real-time robotics applications.
-
-## References
-
-- Thrun, S., Burgard, W., & Fox, D. (2005). *Probabilistic Robotics*. MIT Press.
-- CUDA Programming Guide: https://docs.nvidia.com/cuda/
