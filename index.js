@@ -5,9 +5,11 @@
  */
 
 const pswarm = require('./build/Release/pswarm.node');
+const { TermVisualizer } = require('./lib/term_visualizer');
 
 module.exports = {
     ParticleSlam: pswarm.ParticleSlam,
     load_map_from_file: pswarm.load_map_from_file,
-    save_map_to_file: pswarm.save_map_to_file
+    save_map_to_file: pswarm.save_map_to_file,
+    TermVisualizer: TermVisualizer    
 };

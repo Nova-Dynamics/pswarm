@@ -5,6 +5,8 @@ x64/
 *.png
 *.py
 node_modules/
+examples/
+kernel.cu
 build/
 dist/
 *.vcxproj*
