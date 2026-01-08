@@ -421,9 +421,10 @@ public:
     /**
      * @brief Generate map from highest-scoring particle's trajectory (SLAM mode)
      * Transforms all chunk observations into common reference frame
+     * @param start_chunk_index Starting index for chunks to include (default: 0)
      * @return New map containing best particle observations (caller must delete)
      */
-    Map* bake_best_particle_map();
+    Map* bake_best_particle_map(int start_chunk_index = 0);
 
     // ========== SLAM Mode Functions ==========
     
@@ -466,9 +467,10 @@ public:
     /**
      * @brief Merge best particle's map with global reference map
      * Creates updated global map by adding best particle observations
+     * @param start_chunk_index Starting index for chunks to include (default: 0)
      * @return New map containing merged observations (caller must delete)
      */
-    Map* bake_global_map_best_particle();
+    Map* bake_global_map_best_particle(int start_chunk_index = 0);
     
     /**
      * @brief Calculate mean, covariance, and Gaussianity test for particle distribution

@@ -374,7 +374,12 @@ private:
     Napi::Value BakeBestParticleMap(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
         
-        Map* map = particle_slam_->bake_best_particle_map();
+        int start_chunk_index = 0;
+        if (info.Length() > 0 && info[0].IsNumber()) {
+            start_chunk_index = info[0].As<Napi::Number>().Int32Value();
+        }
+        
+        Map* map = particle_slam_->bake_best_particle_map(start_chunk_index);
         Napi::Object result = map_to_object(env, map);
         delete map;
         
@@ -439,7 +444,12 @@ private:
     Napi::Value BakeGlobalMapBestParticle(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
         
-        Map* map = particle_slam_->bake_global_map_best_particle();
+        int start_chunk_index = 0;
+        if (info.Length() > 0 && info[0].IsNumber()) {
+            start_chunk_index = info[0].As<Napi::Number>().Int32Value();
+        }
+        
+        Map* map = particle_slam_->bake_global_map_best_particle(start_chunk_index);
         Napi::Object result = map_to_object(env, map);
         delete map;
         

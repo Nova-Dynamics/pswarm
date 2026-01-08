@@ -758,7 +758,6 @@ ParticleSlam::~ParticleSlam()
 void ParticleSlam::init(unsigned long long random_seed)
 {
     if (initialized_) {
-        fprintf(stderr, "ParticleSlam already initialized!\n");
         return;
     }
     
@@ -908,9 +907,6 @@ void ParticleSlam::set_global_map(const Map& map)
     temp_map.cells = nullptr;
     
     has_global_map_ = true;
-
-    std::cout << "Global map set with dimensions: " 
-              << map.width << " x " << map.height << std::endl;
 }
 
 /**
@@ -1129,8 +1125,6 @@ int ParticleSlam::ingest_visual_measurement(const Chunk& chunk)
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
     
     if (chunk.timestamp <= last_chunk_timestamp_) {
-        fprintf(stderr, "Warning: Chunk timestamp %f is not greater than last chunk timestamp %f\n", 
-                chunk.timestamp, last_chunk_timestamp_);
         return -1;
     }
     
@@ -1149,7 +1143,6 @@ int ParticleSlam::ingest_visual_measurement(const Chunk& chunk)
     delete[] single_particle_traj;
     
     if (chunk_timestep == -1) {
-        fprintf(stderr, "Could not find matching timestep for chunk timestamp %f\n", chunk.timestamp);
         return -1;
     }
     
@@ -1371,16 +1364,17 @@ Measurement ParticleSlam::calculate_measurement()
 /**
  * @brief Merge best particle's map with global reference map
  * Creates updated global map by adding best particle observations
+ * @param start_chunk_index Starting index for chunks to include (default: 0)
  * @return New map containing merged observations (caller must delete)
  * @throws std::runtime_error if not initialized or no global map set
  */
-Map* ParticleSlam::bake_global_map_best_particle()
+Map* ParticleSlam::bake_global_map_best_particle(int start_chunk_index)
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
     if (!has_global_map_) throw std::runtime_error("Global map not set for localization");
     
     // Bake best particle map
-    Map* best_map = bake_best_particle_map();
+    Map* best_map = bake_best_particle_map(start_chunk_index);
 
     // Copy host global map
     Map* global_map_copy = new Map(*h_global_map_);
@@ -1437,16 +1431,19 @@ Map* ParticleSlam::bake_global_map_best_particle()
 /**
  * @brief Generate map from highest-scoring particle's trajectory
  * Transforms all chunk observations into common reference frame
+ * @param start_chunk_index Starting index for chunks to include (default: 0)
  * @return New map containing best particle observations (caller must delete)
  * @throws std::runtime_error if not initialized or no chunks ingested
  */
-Map* ParticleSlam::bake_best_particle_map()
+Map* ParticleSlam::bake_best_particle_map(int start_chunk_index)
 {
     if (!initialized_) throw std::runtime_error("ParticleSlam not initialized");
     
     // Determine actual number of valid chunks
     int num_valid_chunks = chunks_wrapped_ ? max_chunk_length_ : current_chunk_index_;
     if (num_valid_chunks == 0) throw std::runtime_error("No chunks ingested yet");
+    if (start_chunk_index < 0 || start_chunk_index >= num_valid_chunks) 
+        throw std::runtime_error("Invalid start_chunk_index");
     
     // Download scores to find best particle
     float* h_scores = new float[params_.num_particles];
@@ -1488,7 +1485,7 @@ Map* ParticleSlam::bake_best_particle_map()
     float min_x = FLT_MAX, min_y = FLT_MAX;
     float max_x = -FLT_MAX, max_y = -FLT_MAX;
     
-    for (int chunk_i = 0; chunk_i < num_valid_chunks; chunk_i++) {
+    for (int chunk_i = start_chunk_index; chunk_i < num_valid_chunks; chunk_i++) {
         Vec3 chunk_state = h_chunk_states[chunk_i];
         
         // Transform from chunk frame to reference frame
@@ -1542,7 +1539,7 @@ Map* ParticleSlam::bake_best_particle_map()
     }
     
     // Second pass: accumulate cells into map
-    for (int chunk_i = 0; chunk_i < num_valid_chunks; chunk_i++) {
+    for (int chunk_i = start_chunk_index; chunk_i < num_valid_chunks; chunk_i++) {
         Vec3 chunk_state = h_chunk_states[chunk_i];
         
         for (int xi = 0; xi < 60; xi++) {
@@ -1618,13 +1615,11 @@ Map* ParticleSlam::bake_best_particle_map()
  */
 bool save_map_to_file(const Map* map, const char* filename) {
     if (!map || !map->cells || map->width <= 0 || map->height <= 0) {
-        fprintf(stderr, "save_map_to_file: Invalid map\n");
         return false;
     }
     
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        fprintf(stderr, "save_map_to_file: Failed to open file '%s' for writing\n", filename);
         return false;
     }
     
@@ -1655,7 +1650,6 @@ bool save_map_to_file(const Map* map, const char* filename) {
         file.write(reinterpret_cast<const char*>(map->cells), num_cells * sizeof(ChunkCell));
         
         if (!file.good()) {
-            fprintf(stderr, "save_map_to_file: Error writing to file\n");
             file.close();
             return false;
         }
@@ -1664,7 +1658,6 @@ bool save_map_to_file(const Map* map, const char* filename) {
         return true;
         
     } catch (const std::exception& e) {
-        fprintf(stderr, "save_map_to_file: Exception - %s\n", e.what());
         file.close();
         return false;
     }
@@ -1679,7 +1672,6 @@ bool save_map_to_file(const Map* map, const char* filename) {
 Map* load_map_from_file(const char* filename) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        fprintf(stderr, "load_map_from_file: Failed to open file '%s' for reading\n", filename);
         return nullptr;
     }
     
@@ -1694,14 +1686,11 @@ Map* load_map_from_file(const char* filename) {
         file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
         
         if (magic != MAP_FILE_MAGIC) {
-            fprintf(stderr, "load_map_from_file: Invalid file format (bad magic number)\n");
             file.close();
             return nullptr;
         }
         
         if (version > MAP_FILE_VERSION) {
-            fprintf(stderr, "load_map_from_file: File version %u is newer than supported version %u\n", 
-                    version, MAP_FILE_VERSION);
             file.close();
             return nullptr;
         }
@@ -1726,7 +1715,6 @@ Map* load_map_from_file(const char* filename) {
         file.read(reinterpret_cast<char*>(&max_y), sizeof(max_y));
         
         if (!file.good() || width <= 0 || height <= 0) {
-            fprintf(stderr, "load_map_from_file: Invalid map dimensions (%d x %d)\n", width, height);
             file.close();
             return nullptr;
         }
@@ -1748,7 +1736,6 @@ Map* load_map_from_file(const char* filename) {
         file.read(reinterpret_cast<char*>(map->cells), num_cells * sizeof(ChunkCell));
         
         if (!file.good()) {
-            fprintf(stderr, "load_map_from_file: Error reading cell data\n");
             delete map;
             file.close();
             return nullptr;
@@ -1756,14 +1743,10 @@ Map* load_map_from_file(const char* filename) {
         
         file.close();
         
-        std::cout << "Loaded map: " << width << " x " << height 
-                  << " (" << num_cells << " cells, " 
-                  << (num_cells * sizeof(ChunkCell)) / 1024.0 << " KB)" << std::endl;
         
         return map;
         
     } catch (const std::exception& e) {
-        fprintf(stderr, "load_map_from_file: Exception - %s\n", e.what());
         file.close();
         return nullptr;
     }

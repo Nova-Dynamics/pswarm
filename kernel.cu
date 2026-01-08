@@ -382,7 +382,7 @@ int localize()
                     // Draw ellipse
                     cv::ellipse(img, cv::Point(mean_px, mean_py), 
                               cv::Size((int)axis1, (int)axis2), 
-                              angle_deg, 0, 360, arrow_color, 2, cv::LINE_AA);
+                              -angle_deg, 0, 360, arrow_color, 2, cv::LINE_AA);
                     
                     // Larger arrow for mean
                     float arrow_length = 0.6f; // 60cm arrow
@@ -813,8 +813,80 @@ int map()
     return 0;
 }
 
+int visualize() {
+    // Load map from file
+    std::cout << "Loading ./map-data-m1.bin..." << std::endl;
+    Map* map = load_map_from_file("./map-data-m2.bin");
+    if (map == nullptr) {
+        std::cerr << "Failed to load map from ./map-data-m1.bin" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "Map loaded successfully!" << std::endl;
+    std::cout << "  Width: " << map->width << " cells" << std::endl;
+    std::cout << "  Height: " << map->height << " cells" << std::endl;
+    std::cout << "  Cell size: " << map->cell_size << " meters" << std::endl;
+    std::cout << "  Bounds: X[" << map->min_x << ", " << map->max_x << "], Y[" << map->min_y << ", " << map->max_y << "]" << std::endl;
+    
+    // Create image for map visualization
+    int pixels_per_cell = 5;
+    int map_img_width = map->width * pixels_per_cell;
+    int map_img_height = map->height * pixels_per_cell;
+    cv::Mat map_img(map_img_height, map_img_width, CV_8UC3, cv::Scalar(255, 255, 255));  // White background
+    
+    std::cout << "Rendering map..." << std::endl;
+    
+    // Draw each cell
+    for (int y = 0; y < map->height; y++) {
+        for (int x = 0; x < map->width; x++) {
+            int idx = y * map->width + x;
+            ChunkCell cell = map->cells[idx];
+            
+            // Only color cells with sufficient observations
+            int total_obs = cell.num_pos + cell.num_neg;
+            if (total_obs > 1) {  // At least 2 observations
+                // Calculate occupancy probability using Beta-Bernoulli model
+                float alpha = 1.0f + 0.7f * cell.num_pos;
+                float beta = 1.5f + 0.4f * cell.num_neg;
+                float prob = alpha / (alpha + beta);
+
+                //std::cout << "Cell (" << x << ", " << y << "): num_pos=" << unsigned(cell.num_pos)
+                          //<< ", num_neg=" << unsigned(cell.num_neg) << ", prob=" << prob << std::endl;
+                
+                // Color using HSL interpolation from black to orange
+                cv::Scalar start(0, 0, 0);       // Black
+                cv::Scalar stop(0, 165, 255);    // Orange (BGR)
+                cv::Scalar color = interpolate_hsl(start, stop, prob);
+                
+                cv::rectangle(map_img, 
+                            cv::Point(x * pixels_per_cell, (map->height - 1 - y) * pixels_per_cell), 
+                            cv::Point((x + 1) * pixels_per_cell, (map->height - y) * pixels_per_cell),
+                            color, -1);
+            }
+        }
+    }
+    
+    std::cout << "Map rendered. Displaying..." << std::endl;
+    
+    // Display the map
+    cv::namedWindow("Map Visualization", cv::WINDOW_AUTOSIZE);
+    cv::imshow("Map Visualization", map_img);
+    
+    std::cout << "Press any key to close the window..." << std::endl;
+    cv::waitKey(0);
+    
+    // Cleanup
+    delete map;
+    cv::destroyAllWindows();
+    
+    std::cout << "Visualization complete." << std::endl;
+
+    return 0;
+}
+
 int main()
 {
-    //return localize();
-    return map();
+    return localize();
+    //return map();
+    //return visualize();
 }

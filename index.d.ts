@@ -141,9 +141,10 @@ export class ParticleSlam {
 
     /**
      * Generate map from best particle's trajectory (SLAM mode)
+     * @param start_chunk_index Starting index for chunks to include (default: 0)
      * @returns Generated map
      */
-    bake_best_particle_map(): Map;
+    bake_best_particle_map(start_chunk_index?: number): Map;
 
     /**
      * Accumulate predicted map from trajectory history (SLAM mode)
@@ -175,9 +176,10 @@ export class ParticleSlam {
 
     /**
      * Merge best particle's map with global reference map
+     * @param start_chunk_index Starting index for chunks to include (default: 0)
      * @returns Merged map
      */
-    bake_global_map_best_particle(): Map;
+    bake_global_map_best_particle(start_chunk_index?: number): Map;
 
     /**
      * Calculate mean, covariance, and Gaussianity test for particle distribution
