@@ -1,6 +1,6 @@
 {
   "name": "@novadynamics/pswarm",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "GPU-accelerated particle filter for SLAM and MCL localization",
   "main": "index.js",
   "scripts": {
